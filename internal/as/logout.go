@@ -12,7 +12,8 @@ import (
 // Best-effort, it also blacklists the bearer access token presented with the cookie, so a
 // delegation-capable token cannot outlive the logout. The token's subject must match the session's
 // UserID or nothing is blacklisted (otherwise a caller could revoke a stranger's token). blacklist may
-// be nil; a missing, mismatched, expired or unparseable token is never an error.
+// be nil; a missing, mismatched, expired or unparseable token is never an error. A session lookup or
+// revocation storage failure returns 500 and keeps the cookie so the client can retry.
 func LogoutHandler(store SessionStore, issuer *TokenIssuer, blacklist TokenBlacklistChecker, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
 	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
@@ -28,12 +29,17 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, blacklist TokenBlack
 		// subject-binding check below.
 		session, sessErr := store.Get(c.Request.Context(), sessionID)
 
-		if err := store.Revoke(c.Request.Context(), sessionID); err != nil {
-			logger.Warn("session revocation failed",
+		// A missing session (nil, nil) is already logged out. Any storage failure
+		// must not be reported as success: keep the cookie so the client can retry.
+		revokeErr := store.Revoke(c.Request.Context(), sessionID)
+		if sessErr != nil || (revokeErr != nil && session != nil) {
+			logger.Error("logout: session lookup or revocation failed",
 				zap.String("session_id", sessionID),
-				zap.Error(err),
+				zap.NamedError("lookup_error", sessErr),
+				zap.NamedError("revoke_error", revokeErr),
 			)
-			// Don't expose internal errors — clear cookie regardless.
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke session"})
+			return
 		}
 
 		if blacklist != nil && sessErr == nil && session != nil {

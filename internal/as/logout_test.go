@@ -254,3 +254,45 @@ type failingGetStore struct{ *MemorySessionStore }
 func (failingGetStore) Get(context.Context, string) (*Session, error) {
 	return nil, errors.New("simulated session lookup failure")
 }
+
+// failingRevokeStore makes Revoke fail on an existing session.
+type failingRevokeStore struct{ *MemorySessionStore }
+
+func (failingRevokeStore) Revoke(context.Context, string) error {
+	return errors.New("simulated session revoke failure")
+}
+
+func logoutStatus(t *testing.T, store SessionStore, id string) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, true, zap.NewNop()))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: id})
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func TestLogoutHandler_FailsClosedOnSessionLookupError(t *testing.T) {
+	mem := NewMemorySessionStore()
+	_ = mem.Create(context.Background(), &Session{JTI: "s1", UserID: "u", ExpiresAt: time.Now().Add(time.Hour)})
+	w := logoutStatus(t, failingGetStore{mem}, "s1")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when the session lookup fails, got %d", w.Code)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookieInsecure && c.MaxAge < 0 {
+			t.Fatal("cookie must be kept so the client can retry")
+		}
+	}
+}
+
+func TestLogoutHandler_FailsClosedOnRevokeError(t *testing.T) {
+	mem := NewMemorySessionStore()
+	_ = mem.Create(context.Background(), &Session{JTI: "s1", UserID: "u", ExpiresAt: time.Now().Add(time.Hour)})
+	w := logoutStatus(t, failingRevokeStore{mem}, "s1")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when revocation fails, got %d", w.Code)
+	}
+}
