@@ -1339,8 +1339,8 @@ func TestASConfig_SetDefaults(t *testing.T) {
 	if cfg.SessionTTL != 24*time.Hour {
 		t.Errorf("expected SessionTTL 24h, got %v", cfg.SessionTTL)
 	}
-	if cfg.DefaultMaxTAC != "rwl" {
-		t.Errorf("expected DefaultMaxTAC 'rwl', got %q", cfg.DefaultMaxTAC)
+	if cfg.DefaultMaxTAC != "rwlid" {
+		t.Errorf("expected DefaultMaxTAC 'rwlid', got %q", cfg.DefaultMaxTAC)
 	}
 }
 

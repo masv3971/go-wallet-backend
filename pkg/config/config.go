@@ -158,7 +158,10 @@ type ASConfig struct {
 
 	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.
 	// Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy.
-	// Default: "rwl" (read, write, list)
+	// It is also what /auth/token issues when no tac is requested. Default: "rwlid"
+	// (read, write, list, insert, delete): adding a passkey needs i, and removing a
+	// passkey or deleting the account needs d. Delegation (k) and admin (a) are
+	// never granted by default.
 	DefaultMaxTAC string `yaml:"default_max_tac" envconfig:"DEFAULT_MAX_TAC"`
 
 	// Legacy holds the removed as.legacy.* settings; they are still parsed so an existing
@@ -258,7 +261,7 @@ func (c *ASConfig) SetDefaults() {
 		c.SessionTTL = 24 * time.Hour
 	}
 	if c.DefaultMaxTAC == "" {
-		c.DefaultMaxTAC = "rwl"
+		c.DefaultMaxTAC = "rwlid"
 	}
 }
 
