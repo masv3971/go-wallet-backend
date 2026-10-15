@@ -23,9 +23,10 @@ services:
     ports:
       - "8002:8080"
     volumes:
-      - "./configs/config.yaml:/app/configs/config.yaml"
-      # AS signing key, created by as-key-init
-      - "./configs/as-signing-key.pem:/app/configs/as-signing-key.pem:ro"
+      # The whole directory, not single files: a file bind mount whose source does
+      # not exist yet (the key, on a clean checkout) is created as a directory.
+      # as-key-init writes configs/as-signing-key.pem, which then appears here.
+      - "./configs:/app/configs:ro"
     # Note: healthcheck is not configured because the distroless runtime image
     # doesn't have curl, wget, or a shell. A proper healthcheck would require
     # building a custom health binary into the image.

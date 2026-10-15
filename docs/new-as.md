@@ -353,7 +353,7 @@ docker compose -f docker-compose.softhsm.yml up --build
 curl -s localhost:8080/auth/.well-known/jwks.json   # the kid is the thumbprint of the key in the token
 ```
 
-The entrypoint (`scripts/softhsm-entrypoint.sh`) initialises the token on first start, imports a generated key (the PEM is deleted afterwards), looks up the slot id (SoftHSM renumbers it), renders `configs/config.pkcs11-softhsm.yaml` and starts the server. The token lives in the `softhsm` volume, so the `kid` is stable across restarts; `docker compose -f docker-compose.softhsm.yml down -v` makes a new key. The default PINs are for development only (`SOFTHSM_USER_PIN`, `SOFTHSM_SO_PIN`). `make docker-build-pkcs11` and `make docker-build-softhsm` build the images locally.
+The entrypoint (`scripts/softhsm-entrypoint.sh`) initialises the token on first start, imports a generated key (the PEM is deleted afterwards), looks up the slot id (SoftHSM renumbers it), renders `configs/config.pkcs11-softhsm.yaml` and starts the server. The token lives in the `softhsm` volume, so the `kid` is stable across restarts; `docker compose -f docker-compose.softhsm.yml down -v` makes a new key. The sample config serves plain HTTP, so it sets `as.insecure_cookies: true` (otherwise the browser drops the Secure session cookie); never set that in production. The default PINs are for development only (`SOFTHSM_USER_PIN`, `SOFTHSM_SO_PIN`). `make docker-build-pkcs11` and `make docker-build-softhsm` build the images locally.
 
 #### Using a real HSM (module, module config and module path are injected)
 
