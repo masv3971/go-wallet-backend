@@ -66,6 +66,7 @@ func TestAuthProvider_RemovedLegacyUserRoutes_Answer410(t *testing.T) {
 	p.RegisterRoutes(router)
 
 	for _, path := range []string{
+		"/user/register", "/user/login",
 		"/user/register-webauthn-begin", "/user/register-webauthn-finish",
 		"/user/login-webauthn-begin", "/user/login-webauthn-finish",
 		"/user/session/refresh",

@@ -97,6 +97,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		removed := public.Group("/user")
 		removed.Use(middleware.NoCacheMiddleware(), middleware.LegacyEndpointRemoved())
 		{
+			removed.POST("/register")
+			removed.POST("/login")
 			removed.POST("/register-webauthn-begin")
 			removed.POST("/register-webauthn-finish")
 			removed.POST("/login-webauthn-begin")
