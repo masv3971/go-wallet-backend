@@ -42,6 +42,7 @@ server:
       - "Authorization"
       - "Content-Type"
       - "X-Tenant-ID"
+      - "X-Token-Mode"   # mandatory on /auth/passkey/* (session mode)
       - "If-None-Match"
       - "X-Private-Data-If-Match"
       - "X-Private-Data-If-None-Match"

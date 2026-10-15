@@ -168,7 +168,8 @@ type ASConfig struct {
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
 	// Used for OIDC redirect URIs and, in an isolated wallet-provider or
 	// standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL
-	// without a query or fragment; a path prefix is allowed.
+	// without a query or fragment; a path prefix is allowed. Required whenever the
+	// AS is enabled, including the backend role (startup fails without it).
 	//
 	// A standalone engine (--mode=engine) has no revocation source: a token
 	// stays valid there until it expires, even after logout. Use short access
@@ -1029,6 +1030,8 @@ type CORSConfig struct {
 	AllowedMethods []string `yaml:"allowed_methods" envconfig:"ALLOWED_METHODS"`
 
 	// AllowedHeaders is a list of request headers allowed in cross-origin requests.
+	// An explicit list replaces the defaults, so it must include X-Token-Mode
+	// (mandatory on /auth/passkey/*) and the other headers clients send.
 	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
 
 	// ExposedHeaders is a list of headers that browsers are allowed to access.

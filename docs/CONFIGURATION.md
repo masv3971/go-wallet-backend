@@ -55,7 +55,7 @@ Environment prefix: `WALLET_SERVER`
 | `server.base_url` | `WALLET_SERVER_BASE_URL` | string |  |
 | `server.cors.allowed_origins` | `WALLET_SERVER_CORS_ALLOWED_ORIGINS` | string list | AllowedOrigins is a list of origins that may access the resource. Use "*" to allow all origins (default for development). |
 | `server.cors.allowed_methods` | `WALLET_SERVER_CORS_ALLOWED_METHODS` | string list | AllowedMethods is a list of HTTP methods allowed for cross-origin requests. |
-| `server.cors.allowed_headers` | `WALLET_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. |
+| `server.cors.allowed_headers` | `WALLET_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. An explicit list replaces the defaults, so it must include X-Token-Mode (mandatory on /auth/passkey/*) and the other headers clients send. |
 | `server.cors.exposed_headers` | `WALLET_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. |
 | `server.cors.allow_credentials` | `WALLET_SERVER_CORS_ALLOW_CREDENTIALS` | boolean | AllowCredentials indicates whether the request can include credentials. Cannot be true when AllowedOrigins is "*". |
 | `server.cors.max_age` | `WALLET_SERVER_CORS_MAX_AGE` | integer | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. |
@@ -136,7 +136,7 @@ Environment prefix: `WALLET_AS`
 | `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | REMOVED. true makes startup fail; false is ignored with a startup warning. A pointer so that unset and explicit false differ. |
 | `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | REMOVED and ignored (startup warning). |
 | `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | REMOVED and ignored (startup warning). |
-| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used for OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment; a path prefix is allowed.  A standalone engine (--mode=engine) has no revocation source: a token stays valid there until it expires, even after logout. Use short access token TTLs, or co-host the engine with the backend. |
+| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used for OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment; a path prefix is allowed. Required whenever the AS is enabled, including the backend role (startup fails without it).  A standalone engine (--mode=engine) has no revocation source: a token stays valid there until it expires, even after logout. Use short access token TTLs, or co-host the engine with the backend. |
 | `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
 
 ## wallet_provider

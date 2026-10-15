@@ -301,10 +301,13 @@ them.)
   provider key, baseline rules, `as.audiences` = `wallet-backend`,
   `wallet-engine`, `wallet-registry`); `as.signing_key_path`/`as.rules_dir` or a
   wallet provider key must be configured.
-- The isolated `wallet-provider` role and the standalone `engine` role (no
-  backend provider in the process) validate the tokens of an AS running
-  elsewhere and **require `as.external_url`**; without it they refuse to start.
-  (`as.enabled` is not needed in those processes.)
+- `as.external_url` is **required** wherever AS tokens are validated, including the
+  co-hosted `backend` role (the JWKS is fetched from it). The isolated
+  `wallet-provider` role and the standalone `engine` role (no backend provider in
+  the process) validate the tokens of an AS running elsewhere and refuse to start
+  without it. (`as.enabled` is not needed in those two.)
+- An explicit `server.cors.allowed_headers` list must include `X-Token-Mode`
+  (mandatory on `/auth/passkey/*`); the default list already does.
 - `server.rp_id` no longer has to be listed in `as.audiences`.
 
 ### Client impact
@@ -374,8 +377,8 @@ If the module cannot be loaded the server stops with `pkcs11pool: failed to load
 2. Remove `as.legacy.*`, `jwt.expiry_hours`, `jwt.refresh_days` from configs;
    make sure no environment sets `WALLET_AS_LEGACY_ENABLED=true`.
 3. Make sure the AS can start for the `backend` role (signing key, rules) and
-   that isolated wallet-provider / standalone engine processes have
-   `as.external_url`.
+   that every process, the backend included, has `as.external_url`, and that any
+   explicit `server.cors.allowed_headers` includes `X-Token-Mode`.
 4. Move any other consumer of the shared HMAC secret to JWKS validation.
 5. Rolling back to the previous release restores the legacy AS (set
    `as.legacy.enabled=true` there); a release that contains this change cannot
