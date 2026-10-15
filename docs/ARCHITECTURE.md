@@ -122,8 +122,8 @@ config file and its own HMAC-only JWT validation) was retired in favour of:
   `registry.require_auth` is true). The validator is built by
   `RegistryProvider.buildValidator` (`internal/server/providers.go`) the same
   way as for the standalone engine and the wallet-provider: the JWKS is fetched
-  from `<as.external_url>/auth/.well-known/jwks.json` (no override) through the
-  guarded `http_client` and a loopback relay, the expected issuer is `as.issuer`
+  from `<as.external_url>/auth/.well-known/jwks.json` (no override) by go-tokenauth
+  directly (not through `http_client`; infrastructure-internal); the expected issuer is `as.issuer`
   (falling back to `jwt.issuer`). It does not matter whether `as.enabled` is
   true: a registry-only process does not run the authorization server but
   validates the tokens it issues. There is no HMAC path: the legacy HMAC

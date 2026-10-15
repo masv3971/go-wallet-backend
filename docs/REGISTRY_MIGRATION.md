@@ -50,9 +50,11 @@ accepted at all any more (the legacy HMAC authorization server was removed). Wit
 roles, also when the process does not run the authorization server:
 
 - ES256/ES384/EdDSA access tokens are verified against
-  `<as.external_url>/auth/.well-known/jwks.json` (no override; fetched through
-  the guarded `http_client`, so plain `http` needs `http_client.allow_http`) and
-  must carry the `wallet-registry` audience;
+  `<as.external_url>/auth/.well-known/jwks.json` (no override) and must carry
+  the `wallet-registry` audience. go-tokenauth fetches the JWKS itself: it does
+  not use `http_client`, so neither `http_client.allow_http` nor its address
+  restrictions apply, and plain `http` is accepted. Point `as.external_url` only
+  at your own infrastructure;
 - `as.external_url` and `as.issuer` (or `jwt.issuer`) must be set; startup
   names the missing ones. `jwt.secret` is not needed.
 
