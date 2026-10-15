@@ -1632,6 +1632,7 @@ func TestConfig_Validate_AS_PKCS11(t *testing.T) {
 			cfg := validBaseConfig()
 			cfg.AS.Enabled = true
 			cfg.AS.SigningKeyPKCS11 = tc.p
+			cfg.AS.ExternalURL = "https://as.example"
 			cfg.AS.Issuer = "https://as.example"
 			cfg.AS.Audiences = []string{"wallet-backend"}
 			cfg.AS.RulesDir = "/tmp/rules"
@@ -1697,6 +1698,7 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.ExternalURL = "https://example.com"
 	cfg.AS.RulesDir = "/tmp/rules"
 	cfg.AS.Audiences = []string{"wallet-backend"}
 	cfg.JWT.Issuer = "https://example.com"
@@ -2919,6 +2921,7 @@ func TestConfig_Validate_JWTIssuerIsOnlyASIssuerFallback(t *testing.T) {
 			t.Fatalf("expected an issuer error, got %v", err)
 		}
 		cfg.AS.Issuer = "https://as.example.org"
+		cfg.AS.ExternalURL = "https://as.example.org"
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("as.issuer alone must satisfy it: %v", err)
 		}
@@ -3019,6 +3022,7 @@ func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
 	cfg.JWT.Issuer = "wallet-backend"
 	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
 	cfg.Server.RPID = "wallet.example.com"
+	cfg.AS.ExternalURL = "https://wallet.example.com"
 
 	cfg.EnableForRole()
 	for _, a := range defaultASAudiences {
@@ -3139,7 +3143,7 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	mk := func() *Config {
 		c := validBaseConfig()
 		c.Server.RPID = "wallet.example.org"
-		c.AS = ASConfig{Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x"}
+		c.AS = ASConfig{Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x", ExternalURL: "https://x"}
 		return c
 	}
 	a := mk()
@@ -3228,5 +3232,29 @@ jwt:
 	if p.ModulePath != "/opt/vendor/libvendor-pkcs11.so" || p.SlotID != 7 || p.KeyLabel != "as-signing" ||
 		p.PINPath != "/run/secrets/hsm-pin" || p.PoolSize != 3 {
 		t.Errorf("unexpected PKCS#11 config from env: %+v", p)
+	}
+}
+
+// An enabled AS fetches its own JWKS from as.external_url, so Validate must reject it without one
+// rather than letting startup fail later in the provider.
+func TestConfig_Validate_AS_RequiresExternalURL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS = ASConfig{
+		Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x",
+		Audiences: []string{"wallet-backend"},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "external_url is required") {
+		t.Fatalf("expected an external_url error, got %v", err)
+	}
+	cfg.AS.ExternalURL = "https://x"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("with external_url set: %v", err)
+	}
+
+	off := validBaseConfig()
+	off.AS.Enabled = false
+	if err := off.Validate(); err != nil {
+		t.Fatalf("AS disabled must not need external_url: %v", err)
 	}
 }

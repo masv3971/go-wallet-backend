@@ -441,8 +441,8 @@ Operator checklist when upgrading:
 - `jwt.secret` is still required (>= 32 bytes): it keys the OIDC state-binding
   cookie; it signs no tokens. `jwt.issuer` is the fallback for `as.issuer`.
 - Set `as.external_url` in every process that validates AS tokens, including the
-  `backend` role: the validator fetches the AS JWKS from it, and startup fails
-  without it. The shipped sample configs set it.
+  `backend` role: the validator fetches the AS JWKS from it, and config
+  validation fails without it. The shipped sample configs set it.
 - If you list `server.cors.allowed_headers`, include `X-Token-Mode`: it is
   mandatory on `/auth/passkey/*`, and an explicit list replaces the defaults, so a
   browser preflight without it fails.

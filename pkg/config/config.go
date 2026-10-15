@@ -169,7 +169,7 @@ type ASConfig struct {
 	// Used for OIDC redirect URIs and, in an isolated wallet-provider or
 	// standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL
 	// without a query or fragment; a path prefix is allowed. Required whenever the
-	// AS is enabled, including the backend role (startup fails without it).
+	// AS is enabled, including the backend role (config validation fails without it).
 	//
 	// A standalone engine (--mode=engine) has no revocation source: a token
 	// stays valid there until it expires, even after logout. Use short access
@@ -2518,6 +2518,10 @@ func (c *Config) Validate() error {
 		// Failing fast here, at startup, is far preferable to that.
 		if len(c.AS.Audiences) == 0 {
 			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
+		}
+		// Every process that enables the AS fetches its own JWKS from here.
+		if c.AS.ExternalURL == "" {
+			return fmt.Errorf("as: external_url is required when AS is enabled (the AS JWKS is fetched from <external_url>/auth/.well-known/jwks.json)")
 		}
 	}
 
