@@ -31,9 +31,7 @@ linters:
     - unused
   settings:
     errcheck:
-      # Unchecked type assertions (21 sites, mostly gin context values) are
-      # not enforced; they were not enforced before the v2 migration either.
-      check-type-assertions: false
+      check-type-assertions: true
       check-blank: false
     govet:
       enable-all: true
