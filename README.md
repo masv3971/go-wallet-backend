@@ -163,6 +163,9 @@ go mod download
 # Build
 make build
 
+# Create the AS signing key (gitignored)
+openssl ecparam -name prime256v1 -genkey -noout -out configs/as-signing-key.pem
+
 # Run
 ./bin/server
 ```
@@ -170,7 +173,7 @@ make build
 #### Using docker compose
 
 ```bash
-docker compose up
+docker compose up   # generates configs/as-signing-key.pem on first run
 ```
 
 ### Configuration
