@@ -98,3 +98,32 @@ jobs:
 
       - name: Build
         run: go build -v ./...
+
+  build-variants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Vet without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Vet with pkcs11 tag
+        # Non-blocking until PR #429 (fixes untagged stub tests in
+        # pkg/signing) merges; then remove continue-on-error.
+        continue-on-error: true
+        env:
+          CGO_ENABLED: "1"
+        run: go vet -tags pkcs11 ./...
