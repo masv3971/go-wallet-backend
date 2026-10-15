@@ -1,8 +1,6 @@
 module github.com/sirosfoundation/go-wallet-backend
 
-go 1.27.0
-
-toolchain go1.27.2
+go 1.27.2
 
 require (
 	github.com/descope/virtualwebauthn v1.0.3
@@ -23,7 +21,7 @@ require (
 	github.com/sirosfoundation/go-siros-set v0.1.0
 	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-tokenauth v0.5.0
-	github.com/sirosfoundation/go-trust v0.24.2-0.20261014195925-8f972d99d3fb
+	github.com/sirosfoundation/go-trust v0.25.0
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
@@ -44,13 +42,13 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.15 // indirect
 	github.com/gin-contrib/sse v1.1.2 // indirect
-	github.com/go-openapi/jsonpointer v1.0.1 // indirect
-	github.com/go-playground/locales v0.14.1 // indirect
+	github.com/go-openapi/jsonpointer v1.0.2 // indirect
+	github.com/go-playground/locales v0.14.2 // indirect
 	github.com/go-playground/universal-translator v0.18.2 // indirect
 	github.com/go-playground/validator/v10 v10.30.5 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/go-webauthn/x v0.3.1 // indirect
-	github.com/goccy/go-json v0.10.6 // indirect
+	github.com/goccy/go-json v0.11.2 // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect

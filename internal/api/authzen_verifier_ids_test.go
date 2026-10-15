@@ -21,7 +21,7 @@ const pdpVerifierIDsReply = `{
     "id": "d1",
     "verifier_ids": [
       {"verifier_id_type": "semantic", "verifier_id": "VATSE-5560000001", "basis": "access_certificate"},
-      {"verifier_id_type": "dns", "verifier_id": "verifier.example.com", "basis": "x509_san_dns"}
+      {"verifier_id_type": "x509_san_dns", "verifier_id": "verifier.example.com", "basis": "x509_san_dns"}
     ]
   }
 }`
@@ -29,7 +29,7 @@ const pdpVerifierIDsReply = `{
 // wantVerifierIDs is the verifier_ids member expected in the wallet-facing body.
 var wantVerifierIDs = []interface{}{
 	map[string]interface{}{"verifier_id_type": "semantic", "verifier_id": "VATSE-5560000001", "basis": "access_certificate"},
-	map[string]interface{}{"verifier_id_type": "dns", "verifier_id": "verifier.example.com", "basis": "x509_san_dns"},
+	map[string]interface{}{"verifier_id_type": "x509_san_dns", "verifier_id": "verifier.example.com", "basis": "x509_san_dns"},
 }
 
 // pdpCapture records the raw request body the PDP received.
@@ -95,7 +95,7 @@ func TestEvaluate_RelaysContextVerifierIDs(t *testing.T) {
 
 	reqBody := `{"subject":{"type":"key","id":"https://verifier.example.com"},` +
 		`"resource":{"type":"jwk","id":"https://verifier.example.com"},` +
-		`"context":{"verifier_id_type":"dns"}}`
+		`"context":{"verifier_id_type":"x509_san_dns"}}`
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/evaluate", strings.NewReader(reqBody))
@@ -110,8 +110,8 @@ func TestEvaluate_RelaysContextVerifierIDs(t *testing.T) {
 
 	sent := pdp.received(t)
 	ctxMember, _ := sent["context"].(map[string]interface{})
-	if ctxMember["verifier_id_type"] != "dns" {
-		t.Errorf("PDP request context.verifier_id_type = %v, want dns; PDP body: %v", ctxMember["verifier_id_type"], sent)
+	if ctxMember["verifier_id_type"] != "x509_san_dns" {
+		t.Errorf("PDP request context.verifier_id_type = %v, want x509_san_dns; PDP body: %v", ctxMember["verifier_id_type"], sent)
 	}
 }
 
