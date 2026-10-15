@@ -2,6 +2,8 @@ module github.com/sirosfoundation/go-wallet-backend
 
 go 1.27.0
 
+toolchain go1.27.2
+
 require (
 	github.com/descope/virtualwebauthn v1.0.3
 	github.com/fxamacker/cbor/v2 v2.9.6
