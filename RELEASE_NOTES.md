@@ -4,6 +4,12 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.23.0:start -->
+## [v0.23.0] - 2026-10-15
+
+No changes in this release.
+<!-- release-notes:v0.23.0:end -->
+
 <!-- release-notes:v0.22.4:start -->
 ## [v0.22.4] - 2026-10-15
 
