@@ -220,18 +220,11 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, th *TestHarness, logger *zap.Lo
 		c.JSON(http.StatusOK, status)
 	})
 
-	// WebAuthn routes (public): the AS passkey handlers wired like ASModule.RegisterRoutes; they set the
-	// session cookie and return no token.
+	// Passkey routes: the production registration, shared with ASModule.RegisterRoutes.
 	passkeyHandlers := as.NewPasskeyHandlers(th.Services.WebAuthn, as.NewMemorySessionStore(),
 		&config.ASConfig{DefaultMaxTAC: "rwl", SessionTTL: time.Hour, InsecureCookies: true}, logger)
-	passkey := r.Group("/auth/passkey")
-	passkey.Use(middleware.TenantHeaderMiddleware(store))
-	{
-		passkey.POST("/register/begin", passkeyHandlers.RegisterBegin)
-		passkey.POST("/register/finish", passkeyHandlers.RegisterFinish)
-		passkey.POST("/login/begin", passkeyHandlers.LoginBegin)
-		passkey.POST("/login/finish", passkeyHandlers.LoginFinish)
-	}
+	as.RegisterPasskeyRoutes(r.Group("/auth"), store, passkeyHandlers,
+		middleware.NewValidatorCache(nil, logger), func(c *gin.Context) { c.Next() }, logger)
 
 	// Session routes (authenticated)
 	session := r.Group("/user/session")
@@ -280,7 +273,8 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, th *TestHarness, logger *zap.Lo
 }
 
 // Request makes an HTTP request to the test server
-func (h *TestHarness) Request(method, path string, body interface{}) *Response {
+// headers are alternating name, value pairs.
+func (h *TestHarness) Request(method, path string, body interface{}, headers ...string) *Response {
 	h.T.Helper()
 
 	var bodyReader io.Reader
@@ -299,6 +293,9 @@ func (h *TestHarness) Request(method, path string, body interface{}) *Response {
 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
 	}
 
 	return h.Do(req)
@@ -322,6 +319,12 @@ func (h *TestHarness) Do(req *http.Request) *Response {
 // GET makes a GET request
 func (h *TestHarness) GET(path string) *Response {
 	return h.Request(http.MethodGet, path, nil)
+}
+
+// SessionPOST is POST with X-Token-Mode: session, which the passkey routes require.
+func (h *TestHarness) SessionPOST(path string, body interface{}) *Response {
+	h.T.Helper()
+	return h.Request(http.MethodPost, path, body, "X-Token-Mode", "session")
 }
 
 // POST makes a POST request with a JSON body

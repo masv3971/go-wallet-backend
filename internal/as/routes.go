@@ -166,30 +166,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)
 
-	// Passkey authentication (public, no auth — but tenant-scoped).
-	// Tenant comes from the validated X-Tenant-ID header, never from the
-	// request body, mirroring the /user/* routes (see providers.go's
-	// AuthProvider.RegisterRoutes). Without this, a caller could pick any
-	// tenant's data via a body field with no validation at all (issue #374).
-	passkey := auth.Group("/passkey")
-	passkey.Use(middleware.TenantHeaderMiddleware(m.store))
-	{
-		// Registration routes (with OIDC registration gate).
-		registration := passkey.Group("")
-		registration.Use(m.gateLimitMiddleware(), sessionModeGate(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
-		{
-			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
-			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
-		}
-
-		// Login routes (with OIDC login gate).
-		login := passkey.Group("")
-		login.Use(m.gateLimitMiddleware(), sessionModeGate(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
-		{
-			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
-			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
-		}
-	}
+	RegisterPasskeyRoutes(auth, m.store, m.PasskeyHandler, m.validatorCache, m.gateLimitMiddleware(), m.Logger)
 
 	// OIDC authentication (public, no auth — redirects to IdP).
 	oidcGroup := auth.Group("/oidc")
@@ -212,6 +189,29 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 	// Logout (requires session cookie).
 	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
+}
+
+// RegisterPasskeyRoutes mounts the /passkey routes on the AS group: tenant-scoped from the validated
+// X-Tenant-ID header (never the body, #374), session-mode gated, with the OIDC registration and login gates.
+func RegisterPasskeyRoutes(auth *gin.RouterGroup, store storage.Store, h *PasskeyHandlers,
+	validators *middleware.ValidatorCache, gateLimit gin.HandlerFunc, logger *zap.Logger) {
+	passkey := auth.Group("/passkey")
+	passkey.Use(middleware.TenantHeaderMiddleware(store))
+	{
+		registration := passkey.Group("")
+		registration.Use(gateLimit, sessionModeGate(), middleware.OIDCGateMiddleware(validators, middleware.GateTypeRegistration, logger))
+		{
+			registration.POST("/register/begin", h.RegisterBegin)
+			registration.POST("/register/finish", h.RegisterFinish)
+		}
+
+		login := passkey.Group("")
+		login.Use(gateLimit, sessionModeGate(), middleware.OIDCGateMiddleware(validators, middleware.GateTypeLogin, logger))
+		{
+			login.POST("/login/begin", h.LoginBegin)
+			login.POST("/login/finish", h.LoginFinish)
+		}
+	}
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.

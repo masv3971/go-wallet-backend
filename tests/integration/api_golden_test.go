@@ -10,14 +10,14 @@ func TestGoldenWebAuthnRegistrationBegin(t *testing.T) {
 		{
 			Name: "registration_begin",
 			Request: func(h *TestHarness) *Response {
-				return h.POST("/auth/passkey/register/begin", map[string]interface{}{})
+				return h.SessionPOST("/auth/passkey/register/begin", map[string]interface{}{})
 			},
 			Filename: "webauthn_registration_begin.json",
 		},
 		{
 			Name: "login_begin",
 			Request: func(h *TestHarness) *Response {
-				return h.POST("/auth/passkey/login/begin", map[string]interface{}{})
+				return h.SessionPOST("/auth/passkey/login/begin", map[string]interface{}{})
 			},
 			Filename: "webauthn_login_begin.json",
 		},
