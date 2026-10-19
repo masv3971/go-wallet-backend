@@ -753,6 +753,9 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if !metadataIsSigned || trustResp.Decision {
 		h.inlineLogos(ctx, result.Metadata)
 	}
+	// The org.siros.secret_seed advertisement is not display data: never serve
+	// it to the wallet inside the issuer metadata (display) it merges.
+	stripSecretSeedAdvertisement(result.Metadata)
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the
@@ -976,6 +979,23 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 
 	// No key material available
 	return nil, false
+}
+
+// stripSecretSeedAdvertisement removes credential_metadata["org.siros.secret_seed"]
+// from every credential configuration, in place. It may hold (if the issuer is
+// malformed) secret values and is not display metadata.
+func stripSecretSeedAdvertisement(metadata map[string]interface{}) {
+	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for _, ccRaw := range ccs {
+		if cc, ok := ccRaw.(map[string]interface{}); ok {
+			if cm, ok := cc["credential_metadata"].(map[string]interface{}); ok {
+				delete(cm, "org.siros.secret_seed")
+			}
+		}
+	}
 }
 
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.

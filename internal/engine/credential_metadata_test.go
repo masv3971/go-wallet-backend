@@ -422,3 +422,181 @@ func TestOID4VCISource_NoResponseBodyLoggedOnSuccessPath(t *testing.T) {
 		}
 	}
 }
+
+// --- issuer-metadata seed advertisement: encryption is mandatory ---
+
+func seedCfg(cm string) *CredentialConfig {
+	c := &CredentialConfig{Format: "mso_mdoc"}
+	if cm != "" {
+		c.CredentialMetadata = json.RawMessage(cm)
+	}
+	return c
+}
+
+const advOK = `{"display":[{"name":"x"}],"org.siros.secret_seed":{"namespaces":["org.iso.18013.5.1"]}}`
+
+func TestSecretSeedAdvertised(t *testing.T) {
+	for name, cm := range map[string]string{
+		"none":                "",
+		"no member":           `{"display":[]}`,
+		"not an object":       `["x"]`,
+		"credential_metadata": `null`,
+	} {
+		t.Run("absent/"+name, func(t *testing.T) {
+			ok, err := secretSeedAdvertised(seedCfg(cm))
+			require.NoError(t, err)
+			assert.False(t, ok)
+		})
+	}
+	ok, err := secretSeedAdvertised(seedCfg(advOK))
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	for name, adv := range map[string]string{
+		"hex values not namespaces": `{"ns":"` + secretSeedA + `"}`,
+		"hex alongside namespaces":  `{"namespaces":["a"],"seed":"` + secretSeedA + `"}`,
+		"namespaces as hex string":  `{"namespaces":"` + secretSeedA + `"}`,
+		"namespaces object":         `{"namespaces":{"a":"` + secretSeedA + `"}}`,
+		"empty namespaces":          `{"namespaces":[]}`,
+		"empty namespace name":      `{"namespaces":[""]}`,
+		"non-string namespace":      `{"namespaces":[7]}`,
+		"empty object":              `{}`,
+		"not an object":             `"` + secretSeedA + `"`,
+		"null":                      `null`,
+	} {
+		t.Run("malformed/"+name, func(t *testing.T) {
+			ok, err := secretSeedAdvertised(seedCfg(`{"org.siros.secret_seed":` + adv + `}`))
+			require.Error(t, err)
+			assert.False(t, ok)
+			assert.NotContains(t, err.Error(), secretSeedA)
+		})
+	}
+}
+
+func TestRequestCredential_SeedAdvertised_RequiresEncryption(t *testing.T) {
+	tok := &TokenResponse{AccessToken: "t", TokenType: "Bearer"}
+	hits := 0
+	var sawEncryptionRequest bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		var rb map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&rb)
+		_, sawEncryptionRequest = rb["credential_response_encryption"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(bodyWithMD(`{"org.siros.secret_seed":{"n":"` + secretSeedA + `"}}`)))
+	}))
+	defer srv.Close()
+	adv := seedCfg(advOK)
+
+	run := func(t *testing.T, md *IssuerMetadata, cfg *CredentialConfig) (*CredentialResponse, error, *observer.ObservedLogs) {
+		core, logs := observer.New(zap.DebugLevel)
+		h, cleanup := testOID4VCIHandler(t, srv.Client())
+		t.Cleanup(cleanup)
+		h.Logger = zap.New(core)
+		r, err := h.requestCredential(context.Background(), md, tok, "cfg", cfg, nil)
+		return r, err, logs
+	}
+	noLeak := func(t *testing.T, err error, logs *observer.ObservedLogs) {
+		assert.NotContains(t, err.Error(), secretSeedA)
+		for _, e := range logs.All() {
+			assert.NotContains(t, e.Message, secretSeedA)
+			for _, f := range e.Context {
+				assert.NotContains(t, f.String, secretSeedA)
+				if er, ok := f.Interface.(error); ok {
+					assert.NotContains(t, er.Error(), secretSeedA)
+				}
+			}
+		}
+	}
+
+	t.Run("issuer offers no response encryption: refused before any request", func(t *testing.T) {
+		hits = 0
+		_, err, logs := run(t, &IssuerMetadata{CredentialEndpoint: srv.URL}, adv)
+		require.Error(t, err)
+		assert.Equal(t, 0, hits)
+		noLeak(t, err, logs)
+	})
+	t.Run("no mutually supported alg/enc: refused even if not required", func(t *testing.T) {
+		hits = 0
+		md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: &CredentialResponseEncryptionConfig{
+			AlgValuesSupported: []string{"RSA-OAEP"}, EncValuesSupported: []string{"A128GCM"},
+		}}
+		_, err, logs := run(t, md, adv)
+		require.Error(t, err)
+		assert.Equal(t, 0, hits)
+		noLeak(t, err, logs)
+	})
+	t.Run("plain answer to an encrypted request is refused without leaking", func(t *testing.T) {
+		hits, sawEncryptionRequest = 0, false
+		r, err, logs := run(t, issuerEnc(srv.URL), adv)
+		require.Error(t, err)
+		assert.Nil(t, r)
+		assert.Equal(t, 1, hits)
+		assert.True(t, sawEncryptionRequest, "engine must request encryption")
+		noLeak(t, err, logs)
+	})
+	t.Run("malformed advertisement refused before any request", func(t *testing.T) {
+		hits = 0
+		_, err, logs := run(t, issuerEnc(srv.URL), seedCfg(`{"org.siros.secret_seed":{"ns":"`+secretSeedA+`"}}`))
+		require.Error(t, err)
+		assert.Equal(t, 0, hits)
+		noLeak(t, err, logs)
+	})
+	t.Run("not advertised: plain response still accepted", func(t *testing.T) {
+		hits = 0
+		r, err, _ := run(t, &IssuerMetadata{CredentialEndpoint: srv.URL}, seedCfg(""))
+		require.NoError(t, err)
+		require.NotNil(t, r)
+	})
+	t.Run("advertised and encrypted answer accepted", func(t *testing.T) {
+		esrv := encryptedRawServer(t, bodyWithMD(`{"org.siros.secret_seed":{"n":"`+secretSeedA+`"}}`))
+		defer esrv.Close()
+		h, cleanup := testOID4VCIHandler(t, esrv.Client())
+		defer cleanup()
+		r, err := h.requestCredential(context.Background(), issuerEnc(esrv.URL), tok, "cfg", adv, nil)
+		require.NoError(t, err)
+		relay, err := credentialMetadataRelay(r)
+		require.NoError(t, err)
+		assert.True(t, relay.Encrypted)
+	})
+}
+
+func TestRequestCredential_SeedAdvertised_FlowErrorSent(t *testing.T) {
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	h.httpClient = http.DefaultClient
+	_, err := h.requestCredential(context.Background(), &IssuerMetadata{CredentialEndpoint: "http://127.0.0.1:1"}, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", seedCfg(advOK), nil)
+	require.Error(t, err)
+	m := nextMsg(t, ch)
+	if string(m["type"]) == `"flow_progress"` {
+		m = nextMsg(t, ch)
+	}
+	assert.JSONEq(t, `"flow_error"`, string(m["type"]))
+}
+
+func TestFinishIssuance_SeedAdvertised_PlainDeferredRefused(t *testing.T) {
+	seedMD := `{"org.siros.secret_seed":{"n":"` + secretSeedA + `"}}`
+	t.Run("plain with seed refused", func(t *testing.T) {
+		h, ch, cleanup := captureHandler(t)
+		defer cleanup()
+		err := h.finishIssuance(context.Background(), StepDeferred, parseResp(t, bodyWithMD(seedMD)), seedCfg(advOK), nil, nil, &TokenResponse{})
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), secretSeedA)
+		m := nextMsg(t, ch)
+		assert.JSONEq(t, `"flow_error"`, string(m["type"]))
+	})
+	t.Run("plain without seed member still completes", func(t *testing.T) {
+		h, ch, cleanup := captureHandler(t)
+		defer cleanup()
+		require.NoError(t, h.finishIssuance(context.Background(), StepDeferred, parseResp(t, bodyWithMD(`{"x":1}`)), seedCfg(advOK), nil, nil, &TokenResponse{}))
+		assert.JSONEq(t, `"flow_complete"`, string(nextMsg(t, ch)["type"]))
+	})
+	t.Run("encrypted with seed completes", func(t *testing.T) {
+		h, ch, cleanup := captureHandler(t)
+		defer cleanup()
+		resp := parseResp(t, bodyWithMD(seedMD))
+		resp.Encrypted = true
+		require.NoError(t, h.finishIssuance(context.Background(), StepRequestingCredential, resp, seedCfg(advOK), nil, nil, &TokenResponse{}))
+		assert.JSONEq(t, `"flow_complete"`, string(nextMsg(t, ch)["type"]))
+	})
+}

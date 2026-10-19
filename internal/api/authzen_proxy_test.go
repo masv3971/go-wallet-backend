@@ -1994,6 +1994,9 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 								},
 							},
 						},
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
+						},
 					},
 				},
 			},
@@ -2057,6 +2060,13 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 	credLogoURI := credLogo["uri"].(string)
 	if !strings.HasPrefix(credLogoURI, "data:image/png;base64,") {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
+	}
+
+	// The seed advertisement is not display data and is never served.
+	if cm, _ := pid["credential_metadata"].(map[string]interface{}); cm != nil {
+		if _, present := cm["org.siros.secret_seed"]; present {
+			t.Error("org.siros.secret_seed must be stripped from served issuer metadata")
+		}
 	}
 }
 

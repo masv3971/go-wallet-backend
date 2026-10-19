@@ -570,6 +570,22 @@ to every credential in `credentials[]`; there is no per-credential copy:
   is absent, the value arrived as plain JSON (always so for deferred issuance);
   clients must refuse secret values in that case. The engine decrypts the JWE
   itself, so the engine (and any TLS terminator) sees the values in clear.
+- Seed delivery requires encryption. When the issuer metadata of the requested
+  credential configuration advertises seed delivery
+  (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
+  = {"namespaces": [...]}`), the engine MUST request response encryption
+  (`credential_response_encryption`, same alg/enc negotiation as always, even when
+  the issuer does not mark encryption as required) and refuses the issuance with
+  `CREDENTIAL_ERROR` if the issuer offers no usable encryption, answers with a
+  plain response (the body is not parsed), or delivers `org.siros.secret_seed` in
+  a plain (deferred) response. No request is sent in the first two cases. An
+  advertisement that is not exactly a non-empty `namespaces` list of strings, in
+  particular one carrying hex values, is malformed: the issuance is refused and the
+  value is never logged or relayed. Errors and logs contain no values.
+- The engine does not treat `org.siros.secret_seed` as display metadata: the
+  issuer-metadata resolve endpoint strips that member from every
+  `credential_metadata` it serves to the wallet, and the response-level object is
+  relayed only on `flow_complete` as above.
 - The engine never logs or persists these values. Any buffer of completion
   messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
   which drops `credential_metadata` and the encrypted flag. Absent member: no
