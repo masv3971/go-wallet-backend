@@ -45,7 +45,7 @@ func seedNS(n, nameLen int) string {
 }
 
 func bodyWithMD(md string) string {
-	return `{"credentials":[{"credential":"c0"},{"credential":"c1"}],"credential_metadata":` + md + `}`
+	return `{"credentials":[{"credential":"c0"},{"credential":"c1"}],"notification_id":"n-1","credential_metadata":` + md + `}`
 }
 
 func parseResp(t *testing.T, body string) *CredentialResponse {
@@ -110,7 +110,7 @@ func TestCredentialMetadataRelay_Malformed(t *testing.T) {
 		"string":                `"` + secretSeedA + `"`,
 		"number":                `7`,
 		"null":                  `null`,
-		"legacy entry array":    `[{"type":"org.siros.NS.secret_seed","value":"` + secretSeedA + `"}]`,
+		"array of objects":      `[{"org.siros.secret_seed":{"n":"` + secretSeedA + `"}}]`,
 		"too many members":      `{` + strings.Join(many, ",") + `}`,
 		"too many nested":       `{"x":{` + strings.Join(manyNested, ",") + `}}`,
 		"too deep objects":      deep,
@@ -150,8 +150,8 @@ func TestCredentialMetadataRelay_Malformed(t *testing.T) {
 	}
 }
 
-// buildCredentialResults no longer carries any metadata: it applies to the
-// whole response and travels on the flow-complete message.
+// credential_metadata applies to the whole response, so it travels on the
+// flow-complete message and not in the per-result entries.
 func TestBuildCredentialResults_DoesNotCarryCredentialMetadata(t *testing.T) {
 	h := &OID4VCIHandler{}
 	res := h.buildCredentialResults(context.Background(), parseResp(t, bodyWithMD(fidelityMD)), &CredentialConfig{Format: "mso_mdoc"}, nil)
@@ -227,7 +227,7 @@ func TestFinishIssuance_RelaysCredentialMetadataOnFlowComplete(t *testing.T) {
 				require.Len(t, creds, 2)
 				for _, c := range creds {
 					_, per := c["credential_metadata"]
-					assert.False(t, per, "no per-credential credential_metadata")
+					assert.False(t, per, "credential_metadata only at response level")
 				}
 			})
 		}
@@ -732,4 +732,50 @@ func TestFinishIssuance_OversizeMetadataFailsCleanly(t *testing.T) {
 	require.Error(t, h.finishIssuance(context.Background(), StepRequestingCredential, parseResp(t, bodyWithMD(md)), seedCfg(""), nil, nil, &TokenResponse{}))
 	m := nextMsg(t, ch)
 	assert.JSONEq(t, `"flow_error"`, string(m["type"]))
+}
+
+func TestFinishIssuance_SeedRequiresNotificationID(t *testing.T) {
+	seedMD := `{"org.siros.secret_seed":{"n":"` + secretSeedA + `"}}`
+	for _, step := range []FlowStep{StepRequestingCredential, StepDeferred} {
+		withID := `{"credentials":[{"credential":"c"}],"notification_id":"n-1","credential_metadata":` + seedMD + `}`
+		without := `{"credentials":[{"credential":"c"}],"credential_metadata":` + seedMD + `}`
+		emptyID := `{"credentials":[{"credential":"c"}],"notification_id":"","credential_metadata":` + seedMD + `}`
+		displayOnly := `{"credentials":[{"credential":"c"}],"credential_metadata":{"display":[{"name":"A"}]}}`
+
+		t.Run(string(step)+"/seed with notification_id passes", func(t *testing.T) {
+			h, ch, cleanup := captureHandler(t)
+			defer cleanup()
+			resp := parseResp(t, withID)
+			resp.Encrypted = true
+			require.NoError(t, h.finishIssuance(context.Background(), step, resp, seedCfg(""), nil, nil, &TokenResponse{}))
+			assert.JSONEq(t, `"flow_complete"`, string(nextMsg(t, ch)["type"]))
+		})
+		for name, body := range map[string]string{"absent": without, "empty": emptyID} {
+			t.Run(string(step)+"/seed with "+name+" notification_id fails", func(t *testing.T) {
+				h, ch, cleanup := captureHandler(t)
+				defer cleanup()
+				resp := parseResp(t, body)
+				resp.Encrypted = true
+				err := h.finishIssuance(context.Background(), step, resp, seedCfg(""), nil, nil, &TokenResponse{})
+				require.Error(t, err)
+				assert.NotContains(t, err.Error(), secretSeedA)
+				m := nextMsg(t, ch)
+				assert.JSONEq(t, `"flow_error"`, string(m["type"]))
+				assert.Contains(t, string(m["error"]), string(ErrCodeCredentialError))
+				select {
+				case extra := <-ch:
+					t.Fatalf("unexpected extra message %s", extra["type"])
+				case <-time.After(100 * time.Millisecond):
+				}
+			})
+		}
+		t.Run(string(step)+"/display-only without notification_id relays", func(t *testing.T) {
+			h, ch, cleanup := captureHandler(t)
+			defer cleanup()
+			require.NoError(t, h.finishIssuance(context.Background(), step, parseResp(t, displayOnly), seedCfg(""), nil, nil, &TokenResponse{}))
+			m := nextMsg(t, ch)
+			assert.JSONEq(t, `"flow_complete"`, string(m["type"]))
+			assert.Equal(t, `{"display":[{"name":"A"}]}`, string(m["credential_metadata"]))
+		})
+	}
 }

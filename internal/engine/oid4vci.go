@@ -1178,6 +1178,11 @@ func (h *OID4VCIHandler) finishIssuance(ctx context.Context, step FlowStep, resp
 			err = errors.New("secret seed credential_metadata arrived in a plain response")
 		}
 	}
+	if err == nil && relay != nil && hasSecretSeedMember(relay.Metadata) && resp.NotificationID == "" {
+		// privatedata-spec 5A.2: a delivered seed needs the response-level
+		// notification_id, so the issuer can be told if the wallet rejects it.
+		err = errors.New("secret seed credential_metadata without a notification_id")
+	}
 	if err != nil {
 		h.Logger.Warn("rejecting credential response", zap.Error(err))
 		_ = h.Error(step, ErrCodeCredentialError, "Issuer returned malformed credential metadata")

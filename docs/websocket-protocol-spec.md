@@ -538,7 +538,7 @@ Response-level `credential_metadata` (optional): when the issuer's Credential
 Response (or Deferred Credential Response) carries the OpenID4VCI 1.1
 response-level `credential_metadata` object (openid/OpenID4VCI#721), the engine
 validates it and relays it as ONE top-level member of `flow_complete`. It applies
-to every credential in `credentials[]`; there is no per-credential copy:
+to every credential in `credentials[]`:
 
 ```
 {
@@ -577,6 +577,11 @@ to every credential in `credentials[]`; there is no per-credential copy:
   is absent, the value arrived as plain JSON (always so for deferred issuance);
   clients must refuse secret values in that case. The engine decrypts the JWE
   itself, so the engine (and any TLS terminator) sees the values in clear.
+- A response whose `credential_metadata` carries `org.siros.secret_seed` must
+  also carry a non-empty response-level `notification_id` (privatedata-spec
+  5A.2); otherwise the issuance fails with `CREDENTIAL_ERROR` and no
+  `flow_complete`. This applies to normal and deferred completion alike.
+  Display-only `credential_metadata` needs no `notification_id`.
 - Seed delivery requires encryption. When the issuer metadata of the requested
   credential configuration advertises seed delivery
   (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
