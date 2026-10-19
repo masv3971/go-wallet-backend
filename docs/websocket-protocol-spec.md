@@ -556,9 +556,11 @@ to every credential in `credentials[]`; there is no per-credential copy:
   insignificant whitespace is removed and the JSON encoder may write `<`, `>`, `&`
   as `\u` escapes (value-identical). Unknown members are relayed untouched:
   wallets ignore members they do not know.
-- `org.siros.secret_seed`, when present, must be a non-empty object mapping
-  non-empty namespace names to non-empty lowercase hex strings (even length, at
-  most 512 characters).
+- `org.siros.secret_seed`, when present, must be an object of 1 to 8 members
+  mapping a namespace (1 to 64 UTF-8 bytes, not the reserved name `namespaces`)
+  to a seed of exactly 32 lowercase hex characters (privatedata-spec 5A.1). The
+  advertisement form (`{"namespaces": [...]}`) in a response is therefore
+  rejected, as is uppercase or wrong-length hex.
 - Limits: at most 32 KiB encoded, nesting depth at most 8 (the object itself is
   depth 1), at most 16 members in any one object, member names at most 256 bytes,
   and no duplicate member names in any object. A malformed or over-cap value
@@ -573,19 +575,26 @@ to every credential in `credentials[]`; there is no per-credential copy:
 - Seed delivery requires encryption. When the issuer metadata of the requested
   credential configuration advertises seed delivery
   (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
-  = {"namespaces": [...]}`), the engine MUST request response encryption
-  (`credential_response_encryption`, same alg/enc negotiation as always, even when
-  the issuer does not mark encryption as required) and refuses the issuance with
-  `CREDENTIAL_ERROR` if the issuer offers no usable encryption, answers with a
-  plain response (the body is not parsed), or delivers `org.siros.secret_seed` in
-  a plain (deferred) response. No request is sent in the first two cases. An
-  advertisement that is not exactly a non-empty `namespaces` list of strings, in
-  particular one carrying hex values, is malformed: the issuance is refused and the
-  value is never logged or relayed. Errors and logs contain no values.
-- The engine does not treat `org.siros.secret_seed` as display metadata: the
-  issuer-metadata resolve endpoint strips that member from every
-  `credential_metadata` it serves to the wallet, and the response-level object is
-  relayed only on `flow_complete` as above.
+  = {"namespaces": [...]}`: 1 to 8 distinct names of 1 to 64 bytes, none named
+  `namespaces`, no other member; privatedata-spec 5A.4), the engine MUST request
+  response encryption (`credential_response_encryption`, same alg/enc negotiation
+  as always, even when the issuer does not mark encryption as required) and
+  refuses the issuance with `CREDENTIAL_ERROR` if the issuer offers no usable
+  encryption (no request is sent) or answers with a plain response (the body is
+  not parsed). Independently of any advertisement, a plain response (including
+  every deferred response) that carries `org.siros.secret_seed` is refused.
+  Errors and logs contain no values.
+- A malformed advertisement (hex or other values instead of a name list, wrong
+  counts, duplicate or over-long names) means the configuration is not offered
+  (privatedata-spec 5A.3): the engine drops it when decoding issuer metadata
+  (logging only the configuration id) and the resolve endpoint removes the whole
+  configuration from the metadata it serves, so no value reaches the wallet.
+- A valid advertisement is public names-only data and is served to the wallet
+  unchanged in the issuer metadata; the wallet needs it to request encryption.
+  The engine never merges `org.siros.secret_seed`, from issuer metadata or from
+  a response, into display metadata it computes; the response-level object is
+  relayed only on `flow_complete` as above, and the wallet strips the member
+  before merging display data.
 - The engine never logs or persists these values. Any buffer of completion
   messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
   which drops `credential_metadata` and the encrypted flag. Absent member: no

@@ -1998,6 +1998,12 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
 						},
 					},
+					"leaky": map[string]interface{}{
+						"format": "vc+sd-jwt",
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"ns": "00112233445566778899aabbccddeeff"},
+						},
+					},
 				},
 			},
 		},
@@ -2062,11 +2068,17 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
 	}
 
-	// The seed advertisement is not display data and is never served.
-	if cm, _ := pid["credential_metadata"].(map[string]interface{}); cm != nil {
-		if _, present := cm["org.siros.secret_seed"]; present {
-			t.Error("org.siros.secret_seed must be stripped from served issuer metadata")
-		}
+	// A valid advertisement (names only) is public and is served; a malformed
+	// one (hex values) makes the configuration "not offered".
+	cm, _ := pid["credential_metadata"].(map[string]interface{})
+	if cm == nil || cm["org.siros.secret_seed"] == nil {
+		t.Error("valid org.siros.secret_seed advertisement must be served to the wallet")
+	}
+	if _, present := ccs["leaky"]; present {
+		t.Error("configuration with a malformed secret seed member must not be offered")
+	}
+	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
+		t.Error("seed value must never reach the wallet")
 	}
 }
 

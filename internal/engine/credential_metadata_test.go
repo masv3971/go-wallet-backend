@@ -34,6 +34,16 @@ const secretSeedB = "0cc175b9c0f1b6a831c399e269772661"
 const fidelityMD = `{"org.siros.secret_seed":{"ns1":"` + secretSeedA + `","ns2":"` + secretSeedB + `"},` +
 	`"org.example.ext":{"n":1.50,"m":2.0,"big":12345678901234567890,"arr":[1,{"z":null}],"s":"x"},"alg":"ES256","count":7}`
 
+// seedNS returns n distinct "<name>":"<seed>" members with names of nameLen bytes.
+func seedNS(n, nameLen int) string {
+	var parts []string
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("%0*d", nameLen, i)
+		parts = append(parts, `"`+name+`":"`+secretSeedA+`"`)
+	}
+	return strings.Join(parts, ",")
+}
+
 func bodyWithMD(md string) string {
 	return `{"credentials":[{"credential":"c0"},{"credential":"c1"}],"credential_metadata":` + md + `}`
 }
@@ -75,7 +85,7 @@ func TestCredentialMetadataRelay_ValidShapes(t *testing.T) {
 		"max depth":                deep,
 		"max members":              `{` + strings.Join(many, ",") + `}`,
 		"max key length":           `{"` + strings.Repeat("k", maxCredentialMetadataKeyLen) + `":1}`,
-		"max seed hex":             `{"org.siros.secret_seed":{"n":"` + strings.Repeat("ab", maxSecretSeedHexLen/2) + `"}}`,
+		"max seed namespaces":      `{"org.siros.secret_seed":{` + seedNS(maxSeedNamespaces, maxSeedNamespaceBytes) + `}}`,
 		"same key in separate obj": `{"a":{"x":1},"b":{"x":2}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -119,7 +129,12 @@ func TestCredentialMetadataRelay_Malformed(t *testing.T) {
 		"seed uppercase hex":    `{"org.siros.secret_seed":{"n":"` + strings.ToUpper(secretSeedA) + `"}}`,
 		"seed odd length":       `{"org.siros.secret_seed":{"n":"` + secretSeedA + `a"}}`,
 		"seed non hex":          `{"org.siros.secret_seed":{"n":"` + secretSeedA[:30] + `zz"}}`,
-		"seed too long":         `{"org.siros.secret_seed":{"n":"` + strings.Repeat("ab", maxSecretSeedHexLen/2+1) + `"}}`,
+		"seed 31 chars":         `{"org.siros.secret_seed":{"n":"` + secretSeedA[:31] + `"}}`,
+		"seed 34 chars":         `{"org.siros.secret_seed":{"n":"` + secretSeedA + `ab"}}`,
+		"too many namespaces":   `{"org.siros.secret_seed":{` + seedNS(maxSeedNamespaces+1, 4) + `}}`,
+		"namespace too long":    `{"org.siros.secret_seed":{` + seedNS(1, maxSeedNamespaceBytes+1) + `}}`,
+		"reserved namespace":    `{"org.siros.secret_seed":{"namespaces":"` + secretSeedA + `"}}`,
+		"advertisement form":    `{"org.siros.secret_seed":{"namespaces":["org.siros.nym_auth"]}}`,
 	}
 	for name, md := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -181,18 +196,25 @@ func nextMsg(t *testing.T, ch chan map[string]json.RawMessage) map[string]json.R
 	}
 }
 
+// Same awkward members, but no seed: a plain response may carry this.
+const fidelityNoSeedMD = `{"org.example.ext":{"n":1.50,"m":2.0,"big":12345678901234567890},"alg":"ES256","count":7}`
+
 func TestFinishIssuance_RelaysCredentialMetadataOnFlowComplete(t *testing.T) {
 	for _, step := range []FlowStep{StepRequestingCredential, StepDeferred} {
 		for _, enc := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/encrypted=%v", step, enc), func(t *testing.T) {
 				h, ch, cleanup := captureHandler(t)
 				defer cleanup()
-				resp := parseResp(t, bodyWithMD(fidelityMD))
+				want := fidelityNoSeedMD
+				if enc {
+					want = fidelityMD // only an encrypted response may carry a seed
+				}
+				resp := parseResp(t, bodyWithMD(want))
 				resp.Encrypted = enc
 				require.NoError(t, h.finishIssuance(context.Background(), step, resp, &CredentialConfig{Format: "mso_mdoc"}, nil, nil, &TokenResponse{}))
 				m := nextMsg(t, ch)
 				assert.JSONEq(t, `"flow_complete"`, string(m["type"]))
-				assert.Equal(t, fidelityMD, string(m["credential_metadata"]), "object relayed verbatim at top level")
+				assert.Equal(t, want, string(m["credential_metadata"]), "object relayed verbatim at top level")
 				_, hasFlag := m["credential_metadata_encrypted_response"]
 				assert.Equal(t, enc, hasFlag)
 				if enc {
@@ -451,6 +473,14 @@ func TestSecretSeedAdvertised(t *testing.T) {
 	ok, err := secretSeedAdvertised(seedCfg(advOK))
 	require.NoError(t, err)
 	assert.True(t, ok)
+	for _, edge := range []string{
+		`{"namespaces":["a","b","c","d","e","f","g","h"]}`,
+		`{"namespaces":["` + strings.Repeat("n", 64) + `"]}`,
+	} {
+		ok, err = secretSeedAdvertised(seedCfg(`{"org.siros.secret_seed":` + edge + `}`))
+		require.NoError(t, err)
+		assert.True(t, ok)
+	}
 
 	for name, adv := range map[string]string{
 		"hex values not namespaces": `{"ns":"` + secretSeedA + `"}`,
@@ -458,6 +488,11 @@ func TestSecretSeedAdvertised(t *testing.T) {
 		"namespaces as hex string":  `{"namespaces":"` + secretSeedA + `"}`,
 		"namespaces object":         `{"namespaces":{"a":"` + secretSeedA + `"}}`,
 		"empty namespaces":          `{"namespaces":[]}`,
+		"nine namespaces":           `{"namespaces":["a","b","c","d","e","f","g","h","i"]}`,
+		"duplicate namespace":       `{"namespaces":["a","a"]}`,
+		"namespace 65 bytes":        `{"namespaces":["` + strings.Repeat("n", 65) + `"]}`,
+		"reserved name":             `{"namespaces":["namespaces"]}`,
+		"extra non-string member":   `{"namespaces":["a"],"x":1}`,
 		"empty namespace name":      `{"namespaces":[""]}`,
 		"non-string namespace":      `{"namespaces":[7]}`,
 		"empty object":              `{}`,
@@ -585,6 +620,13 @@ func TestFinishIssuance_SeedAdvertised_PlainDeferredRefused(t *testing.T) {
 		m := nextMsg(t, ch)
 		assert.JSONEq(t, `"flow_error"`, string(m["type"]))
 	})
+	t.Run("plain with seed refused even when not advertised", func(t *testing.T) {
+		h, ch, cleanup := captureHandler(t)
+		defer cleanup()
+		err := h.finishIssuance(context.Background(), StepDeferred, parseResp(t, bodyWithMD(seedMD)), seedCfg(""), nil, nil, &TokenResponse{})
+		require.Error(t, err)
+		assert.JSONEq(t, `"flow_error"`, string(nextMsg(t, ch)["type"]))
+	})
 	t.Run("plain without seed member still completes", func(t *testing.T) {
 		h, ch, cleanup := captureHandler(t)
 		defer cleanup()
@@ -599,4 +641,36 @@ func TestFinishIssuance_SeedAdvertised_PlainDeferredRefused(t *testing.T) {
 		require.NoError(t, h.finishIssuance(context.Background(), StepRequestingCredential, resp, seedCfg(advOK), nil, nil, &TokenResponse{}))
 		assert.JSONEq(t, `"flow_complete"`, string(nextMsg(t, ch)["type"]))
 	})
+}
+
+// A malformed advertisement makes the configuration "not offered": it is
+// dropped when the issuer metadata is decoded (privatedata-spec 5A.3).
+func TestCredentialConfigurations_MalformedSeedAdvertisementNotOffered(t *testing.T) {
+	var c CredentialConfigurations
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"good":{"format":"mso_mdoc","credential_metadata":`+advOK+`},
+		"none":{"format":"mso_mdoc"},
+		"hex":{"format":"mso_mdoc","credential_metadata":{"org.siros.secret_seed":{"ns":"`+secretSeedA+`"}}},
+		"dup":{"format":"mso_mdoc","credential_metadata":{"org.siros.secret_seed":{"namespaces":["a","a"]}}}}`), &c))
+	assert.Contains(t, c, "good")
+	assert.Contains(t, c, "none")
+	assert.NotContains(t, c, "hex")
+	assert.NotContains(t, c, "dup")
+}
+
+func TestLogIgnoredCredentialConfigurations_MalformedSeedAdvertisementNoContent(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.New(core)}
+	src := map[string]interface{}{"credential_configurations_supported": map[string]interface{}{
+		"hex": map[string]interface{}{"format": "mso_mdoc", "credential_metadata": map[string]interface{}{
+			"org.siros.secret_seed": map[string]interface{}{"ns": secretSeedA}}},
+	}}
+	h.logIgnoredCredentialConfigurations(src, CredentialConfigurations{})
+	require.Equal(t, 1, logs.Len())
+	e := logs.All()[0]
+	assert.NotContains(t, e.Message, secretSeedA)
+	for _, f := range e.Context {
+		assert.NotContains(t, f.String, secretSeedA)
+	}
 }

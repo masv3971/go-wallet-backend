@@ -311,6 +311,11 @@ func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(entry, &cfg); err != nil {
 			continue
 		}
+		// A malformed org.siros.secret_seed advertisement means the
+		// configuration is not offered (privatedata-spec 5A.3).
+		if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
+			continue
+		}
 		parsed[id] = cfg
 	}
 	*c = parsed
@@ -1167,9 +1172,9 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 func (h *OID4VCIHandler) finishIssuance(ctx context.Context, step FlowStep, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
 	relay, err := credentialMetadataRelay(resp)
 	if err == nil && relay != nil && !relay.Encrypted {
-		// A plain (deferred) response must not deliver a seed that the issuer
-		// metadata advertised as encrypted-only.
-		if adv, _ := secretSeedAdvertised(config); adv && hasSecretSeedMember(relay.Metadata) {
+		// A plain response never delivers a seed, advertised or not
+		// (privatedata-spec 5A.4); deferred responses are always plain.
+		if hasSecretSeedMember(relay.Metadata) {
 			err = errors.New("secret seed credential_metadata arrived in a plain response")
 		}
 	}
@@ -1415,6 +1420,10 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 			h.Logger.Warn("ignoring credential configuration with a broken format",
 				zap.String("credential_configuration_id", id),
 				zap.Error(err))
+		} else if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
+			// Never log the member: a malformed one may carry seed values.
+			h.Logger.Warn("ignoring credential configuration with a malformed secret seed advertisement",
+				zap.String("credential_configuration_id", id))
 		}
 	}
 }
@@ -2877,56 +2886,66 @@ const (
 	maxCredentialMetadataDepth   = 8         // nesting of objects/arrays; the top-level object is depth 1
 	maxCredentialMetadataMembers = 16        // members of any one object
 	maxCredentialMetadataKeyLen  = 256       // bytes of any member name
-	maxSecretSeedHexLen          = 512       // hex chars of one seed value
+	maxSeedNamespaces            = 8         // privatedata-spec 5A.1/5A.4: 1..8 namespaces
+	maxSeedNamespaceBytes        = 64        // privatedata-spec 5A.1: 1..64 UTF-8 bytes
 
 	// secretSeedMember is the SIROS extension member of credential_metadata:
 	// {"<namespace>": "<lowercase hex>", ...}.
 	secretSeedMember = "org.siros.secret_seed"
 )
 
-// secretSeedAdvertised reports whether the issuer metadata of a credential
-// configuration advertises secret_seed delivery:
-// credential_metadata["org.siros.secret_seed"] = {"namespaces": [...]}.
-// An advertisement that is not exactly that shape, in particular one carrying
-// values instead of a namespace list, is malformed and returns an error that
-// never includes the offending content. A credential_metadata that is not an
-// object, or has no such member, advertises nothing.
-func secretSeedAdvertised(config *CredentialConfig) (bool, error) {
-	if config == nil || len(config.CredentialMetadata) == 0 {
-		return false, nil
+// SecretSeedAdvertisement inspects the credential_metadata of one credential
+// configuration of the issuer metadata for the org.siros.secret_seed member.
+// present reports whether the member exists; ok is true only for the valid
+// advertisement form {"namespaces": [1..8 distinct names of 1..64 bytes, none
+// "namespaces"]} (privatedata-spec 5A.4). Anything else, in particular a member
+// carrying hex or other values instead of a name list, is malformed
+// (present && !ok). A credential_metadata that is not an object has no member.
+func SecretSeedAdvertisement(credentialMetadata json.RawMessage) (present, ok bool) {
+	if len(credentialMetadata) == 0 {
+		return false, false
 	}
 	var md map[string]json.RawMessage
-	if json.Unmarshal(config.CredentialMetadata, &md) != nil {
-		return false, nil
+	if json.Unmarshal(credentialMetadata, &md) != nil {
+		return false, false
 	}
-	raw, ok := md[secretSeedMember]
-	if !ok {
-		return false, nil
+	raw, present := md[secretSeedMember]
+	if !present {
+		return false, false
 	}
-	malformed := fmt.Errorf("issuer metadata %s advertisement is malformed", secretSeedMember)
 	var adv map[string]json.RawMessage
-	if json.Unmarshal(raw, &adv) != nil || adv == nil {
-		return false, malformed
-	}
-	for k, v := range adv {
-		if k == "namespaces" {
-			continue
-		}
-		var str string
-		if json.Unmarshal(v, &str) == nil {
-			return false, malformed // a string member could be a seed value
-		}
+	if json.Unmarshal(raw, &adv) != nil || len(adv) != 1 {
+		return true, false
 	}
 	var ns []string
-	if json.Unmarshal(adv["namespaces"], &ns) != nil || len(ns) == 0 || len(ns) > maxCredentialMetadataMembers {
-		return false, malformed
+	if json.Unmarshal(adv["namespaces"], &ns) != nil || len(ns) == 0 || len(ns) > maxSeedNamespaces {
+		return true, false
 	}
+	seen := make(map[string]struct{}, len(ns))
 	for _, n := range ns {
-		if n == "" || len(n) > maxCredentialMetadataKeyLen {
-			return false, malformed
+		if !validSeedNamespace(n) {
+			return true, false
 		}
+		if _, dup := seen[n]; dup {
+			return true, false
+		}
+		seen[n] = struct{}{}
 	}
-	return true, nil
+	return true, true
+}
+
+// secretSeedAdvertised reports whether a credential configuration advertises
+// seed delivery. A malformed advertisement returns an error that never
+// includes the offending content.
+func secretSeedAdvertised(config *CredentialConfig) (bool, error) {
+	if config == nil {
+		return false, nil
+	}
+	present, ok := SecretSeedAdvertisement(config.CredentialMetadata)
+	if present && !ok {
+		return false, fmt.Errorf("issuer metadata %s advertisement is malformed", secretSeedMember)
+	}
+	return ok, nil
 }
 
 func hasSecretSeedMember(md json.RawMessage) bool {
@@ -2938,7 +2957,14 @@ func hasSecretSeedMember(md json.RawMessage) bool {
 	return ok
 }
 
-var secretSeedHexRE = regexp.MustCompile(`^([0-9a-f]{2})+$`)
+// A seed is exactly 32 lowercase hex characters (16 bytes), privatedata-spec 5A.1.
+var secretSeedHexRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// validSeedNamespace: 1..64 bytes, and not the name "namespaces", which is
+// reserved for the issuer-metadata advertisement (5A.1).
+func validSeedNamespace(n string) bool {
+	return n != "" && n != "namespaces" && len(n) <= maxSeedNamespaceBytes
+}
 
 // credentialMetadataRelay validates the response-level credential_metadata of
 // an issuer response and returns what to relay (nil when absent). Errors never
@@ -2974,12 +3000,14 @@ func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
 	}
 	if seed, ok := members[secretSeedMember]; ok {
 		var ns map[string]string
-		if err := json.Unmarshal(seed, &ns); err != nil || len(ns) == 0 {
-			return nil, fmt.Errorf("credential_metadata %s is not a non-empty object of strings", secretSeedMember)
+		if err := json.Unmarshal(seed, &ns); err != nil || len(ns) == 0 || len(ns) > maxSeedNamespaces {
+			return nil, fmt.Errorf("credential_metadata %s is not an object of 1..%d string seeds", secretSeedMember, maxSeedNamespaces)
 		}
+		// The advertisement form ("namespaces") is not a delivery and is
+		// rejected here: "namespaces" is not a valid seed namespace.
 		for k, v := range ns {
-			if k == "" || len(v) > maxSecretSeedHexLen || !secretSeedHexRE.MatchString(v) {
-				return nil, fmt.Errorf("credential_metadata %s has an invalid namespace or non-lowercase-hex value", secretSeedMember)
+			if !validSeedNamespace(k) || !secretSeedHexRE.MatchString(v) {
+				return nil, fmt.Errorf("credential_metadata %s has an invalid namespace or a seed that is not 32 lowercase hex characters", secretSeedMember)
 			}
 		}
 	}
