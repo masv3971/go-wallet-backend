@@ -3004,7 +3004,7 @@ func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
 	if len(raw) > maxCredentialMetadataBytes {
 		return nil, fmt.Errorf("credential_metadata exceeds %d bytes", maxCredentialMetadataBytes)
 	}
-	if err := checkCredentialMetadataShape(raw); err != nil {
+	if err := enforceCredentialMetadataLimits(raw); err != nil {
 		return nil, err
 	}
 	var members map[string]json.RawMessage
@@ -3031,8 +3031,8 @@ func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(buf.Bytes()), nil
 }
 
-// shapeFrame is one open object or array while walking credential_metadata.
-type shapeFrame struct {
+// metadataLimitsFrame is one open object or array while walking credential_metadata.
+type metadataLimitsFrame struct {
 	obj       bool
 	expectKey bool
 	members   int
@@ -3041,13 +3041,13 @@ type shapeFrame struct {
 	keys      map[string]struct{}
 }
 
-// shapeWalker tracks the open containers of a credential_metadata token stream.
-type shapeWalker struct {
-	stack []shapeFrame
+// metadataLimitsWalker tracks the open containers of a credential_metadata token stream.
+type metadataLimitsWalker struct {
+	stack []metadataLimitsFrame
 }
 
 // valueDone marks the enclosing object (if any) as ready for its next key.
-func (w *shapeWalker) valueDone() {
+func (w *metadataLimitsWalker) valueDone() {
 	if n := len(w.stack); n > 0 && w.stack[n-1].obj {
 		w.stack[n-1].expectKey = true
 	}
@@ -3055,11 +3055,11 @@ func (w *shapeWalker) valueDone() {
 
 // open pushes a container, enforcing the depth cap and selecting the objects
 // whose member names must be unique (top level and the secret seed object).
-func (w *shapeWalker) open(d json.Delim) error {
+func (w *metadataLimitsWalker) open(d json.Delim) error {
 	if len(w.stack)+1 > maxCredentialMetadataDepth {
 		return fmt.Errorf("credential_metadata nests deeper than %d", maxCredentialMetadataDepth)
 	}
-	f := shapeFrame{obj: d == '{', expectKey: d == '{'}
+	f := metadataLimitsFrame{obj: d == '{', expectKey: d == '{'}
 	if f.obj {
 		top := len(w.stack) == 0
 		seed := len(w.stack) == 1 && w.stack[0].obj && w.stack[0].lastKey == secretSeedMember
@@ -3073,14 +3073,14 @@ func (w *shapeWalker) open(d json.Delim) error {
 }
 
 // expectingKey reports whether the next non-delimiter token is a member name.
-func (w *shapeWalker) expectingKey() bool {
+func (w *metadataLimitsWalker) expectingKey() bool {
 	n := len(w.stack)
 	return n > 0 && w.stack[n-1].obj && w.stack[n-1].expectKey
 }
 
 // key records a member name of the innermost object, enforcing the key-length,
 // uniqueness and member-count caps.
-func (w *shapeWalker) key(key string) error {
+func (w *metadataLimitsWalker) key(key string) error {
 	f := &w.stack[len(w.stack)-1]
 	if len(key) > maxCredentialMetadataKeyLen {
 		return fmt.Errorf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
@@ -3101,7 +3101,7 @@ func (w *shapeWalker) key(key string) error {
 }
 
 // token consumes one token of the stream.
-func (w *shapeWalker) token(tok json.Token) error {
+func (w *metadataLimitsWalker) token(tok json.Token) error {
 	if d, ok := tok.(json.Delim); ok {
 		if d == '{' || d == '[' {
 			return w.open(d)
@@ -3118,14 +3118,14 @@ func (w *shapeWalker) token(tok json.Token) error {
 	return nil
 }
 
-// checkCredentialMetadataShape walks the token stream enforcing the depth,
+// enforceCredentialMetadataLimits walks the token stream enforcing the depth,
 // per-object member and key-length caps everywhere, and rejecting duplicate
 // member names at the top level and inside the org.siros.secret_seed object
 // (elsewhere the object is display data that is relayed as received).
-func checkCredentialMetadataShape(raw json.RawMessage) error {
+func enforceCredentialMetadataLimits(raw json.RawMessage) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber() // numbers are relayed verbatim; no float64 range limit (1e400)
-	var w shapeWalker
+	var w metadataLimitsWalker
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {

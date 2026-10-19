@@ -73,7 +73,7 @@ func TestCredentialMetadataRelay_Absent(t *testing.T) {
 	assert.Nil(t, relay)
 }
 
-func TestCredentialMetadataRelay_ValidShapes(t *testing.T) {
+func TestCredentialMetadataRelay_WithinLimits(t *testing.T) {
 	deep := strings.Repeat(`{"a":`, maxCredentialMetadataDepth) + `1` + strings.Repeat(`}`, maxCredentialMetadataDepth)
 	var many []string
 	for i := 0; i < maxCredentialMetadataMembers; i++ {
@@ -836,9 +836,9 @@ func TestCredentialResponseDecodeErrors_DoNotQuoteContent(t *testing.T) {
 	})
 }
 
-// TestCheckCredentialMetadataShape pins every branch of the token walker,
+// TestEnforceCredentialMetadataLimits pins every branch of the token walker,
 // including the exact rejection reason, independently of the later decode.
-func TestCheckCredentialMetadataShape(t *testing.T) {
+func TestEnforceCredentialMetadataLimits(t *testing.T) {
 	const (
 		invalid = "credential_metadata is not valid JSON"
 		dup     = "credential_metadata has a duplicate member name"
@@ -896,7 +896,7 @@ func TestCheckCredentialMetadataShape(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkCredentialMetadataShape(json.RawMessage(tc.in))
+			err := enforceCredentialMetadataLimits(json.RawMessage(tc.in))
 			if tc.want == "" {
 				require.NoError(t, err)
 				return
