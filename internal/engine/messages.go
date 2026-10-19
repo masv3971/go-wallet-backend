@@ -316,6 +316,22 @@ type FlowStartMessage struct {
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
+// CredentialMetadataRelay is a validated response-level credential_metadata
+// and whether the issuer response carrying it was JWE-encrypted.
+type CredentialMetadataRelay struct {
+	Metadata  json.RawMessage
+	Encrypted bool
+}
+
+// Redacted returns a copy of the message safe to buffer or log: the
+// credential_metadata object (which may hold secrets) is removed. Use this before putting a
+// completion message in any event buffer or log.
+func (m FlowCompleteMessage) Redacted() FlowCompleteMessage {
+	m.CredentialMetadata = nil
+	m.CredentialMetadataEncryptedResponse = false
+	return m
+}
+
 // authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
 // §5.1.1 defines for a credential authorization detail.
 const authorizationDetailTypeOpenIDCredential = "openid_credential"
@@ -392,6 +408,17 @@ type FlowCompleteMessage struct {
 	// The client stores it with RefreshToken and presents it back as
 	// FlowStartMessage.DPoPKeyID on renewal.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+	// CredentialMetadata is the OID4VCI 1.1 response-level credential_metadata
+	// object of the issuer's Credential (or Deferred Credential) Response,
+	// relayed verbatim (compacted) and applying to every credential in
+	// Credentials. Unknown members are preserved. It may carry secrets
+	// (org.siros.secret_seed): never log it, and use Redacted before buffering.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+	// CredentialMetadataEncryptedResponse is true only when CredentialMetadata
+	// came in a JWE-encrypted issuer response. Absent alongside a
+	// CredentialMetadata means it arrived as plain TLS-protected JSON (always
+	// the case for deferred issuance), so a client should refuse secret values.
+	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -587,54 +614,6 @@ type CredentialResult struct {
 	// encrypted) and echoes it back in a credential_notification message when a
 	// lifecycle event occurs.
 	NotificationID string `json:"notification_id,omitempty"`
-	// CredentialMetadata is the issuer's per-credential credential_metadata
-	// extension, relayed (validated, values untouched): the sibling of
-	// "credential" in the issuer's credentials[] element. NOT OID4VCI's
-	// issuer-metadata display object. Entries may carry secrets; never log them.
-	CredentialMetadata []CredentialMetadataEntry `json:"credential_metadata,omitempty"`
-	// CredentialMetadataEncryptedResponse is true when CredentialMetadata came
-	// in a JWE-encrypted issuer response. Absent (false) alongside a non-empty
-	// CredentialMetadata means it arrived as plain TLS-protected JSON (always
-	// the case for deferred issuance), so a client should refuse secret values.
-	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
-}
-
-// CredentialMetadataEntry is one entry of the per-credential credential_metadata
-// extension: an object with a non-empty string "type", a non-null "value" and
-// any further members, which are relayed untouched. Type and Value are
-// conveniences for Go consumers; the wire form is the entry as received
-// (member names, order and number spelling preserved; insignificant whitespace
-// removed and <, >, & possibly \u-escaped by the JSON encoder, which is
-// value-identical). Extra members are untrusted data and may carry secrets.
-type CredentialMetadataEntry struct {
-	Type  string
-	Value json.RawMessage
-
-	raw json.RawMessage // entry as received; nil for entries built in code
-}
-
-// MarshalJSON emits the entry as received, or {"type","value"} when built in code.
-func (e CredentialMetadataEntry) MarshalJSON() ([]byte, error) {
-	if len(e.raw) > 0 {
-		return e.raw, nil
-	}
-	return json.Marshal(struct {
-		Type  string          `json:"type"`
-		Value json.RawMessage `json:"value"`
-	}{e.Type, e.Value})
-}
-
-// UnmarshalJSON keeps the entry's raw bytes alongside Type and Value.
-func (e *CredentialMetadataEntry) UnmarshalJSON(b []byte) error {
-	var v struct {
-		Type  string          `json:"type"`
-		Value json.RawMessage `json:"value"`
-	}
-	if err := json.Unmarshal(b, &v); err != nil {
-		return err
-	}
-	e.Type, e.Value, e.raw = v.Type, v.Value, append(json.RawMessage(nil), b...)
-	return nil
 }
 
 // TrustInfo contains trust evaluation results.

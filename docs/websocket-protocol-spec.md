@@ -534,39 +534,46 @@ Server → Client:
 }
 ```
 
-Per-credential `credential_metadata` (optional): when the issuer's response
-carries a `credential_metadata` member next to `credential` in an element of
-`credentials[]`, the engine validates and relays it on that credential's result:
+Response-level `credential_metadata` (optional): when the issuer's Credential
+Response (or Deferred Credential Response) carries the OpenID4VCI 1.1
+response-level `credential_metadata` object (openid/OpenID4VCI#721), the engine
+validates it and relays it as ONE top-level member of `flow_complete`. It applies
+to every credential in `credentials[]`; there is no per-credential copy:
 
 ```
 {
-  "format": "mso_mdoc",
-  "credential": "<mdoc>",
-  "credential_metadata": [{"type": "org.siros.NS.secret_seed", "value": "..."}],
+  "type": "flow_complete",
+  "credentials": [{"format": "mso_mdoc", "credential": "<mdoc>"}],
+  "credential_metadata": {
+    "org.siros.secret_seed": {"<namespace>": "<lowercase hex>"}
+  },
   "credential_metadata_encrypted_response": true
 }
 ```
 
-- Each entry is an object with a non-empty string `type` (at most 256 bytes) and
-  a present, non-null `value` (any JSON value). Any other member is accepted and
-  relayed as received (name and value untouched). Not the OID4VCI issuer-metadata
-  display object, nor OID4VCI 1.1's response-level `credential_metadata`; those
-  are not read.
-- Fidelity: entries are taken from the raw response bytes, not via a generic
-  decode, so member names, member order and number spelling (`1.50`, `2.0`,
-  integers beyond float64) are preserved. Not byte-exact: insignificant
-  whitespace is removed and the JSON encoder may write `<`, `>`, `&` as `\u`
-  escapes (value-identical). Duplicate member names are not specially handled.
-- Limits: at most 16 entries per credential, `type` at most 256 bytes, each
-  whole entry (extra members included) at most 8 KiB, 32 KiB total per
-  credential. A malformed or oversized member fails the issuance with a
-  `CREDENTIAL_ERROR` flow error; it is never dropped silently.
+- The value must be a JSON object. Members are relayed verbatim, in order and
+  with number spelling (`1.50`, `2.0`, integers beyond float64) preserved; only
+  insignificant whitespace is removed and the JSON encoder may write `<`, `>`, `&`
+  as `\u` escapes (value-identical). Unknown members are relayed untouched:
+  wallets ignore members they do not know.
+- `org.siros.secret_seed`, when present, must be a non-empty object mapping
+  non-empty namespace names to non-empty lowercase hex strings (even length, at
+  most 512 characters).
+- Limits: at most 32 KiB encoded, nesting depth at most 8 (the object itself is
+  depth 1), at most 16 members in any one object, member names at most 256 bytes,
+  and no duplicate member names in any object. A malformed or over-cap value
+  (including `null`, an array or a non-object) fails the issuance with a
+  `CREDENTIAL_ERROR` flow error and no `flow_complete`; it is never dropped
+  silently. Error messages and logs never contain its contents.
 - `credential_metadata_encrypted_response` is `true` only when the issuer's
   response was JWE-encrypted. When `credential_metadata` is present and this flag
   is absent, the value arrived as plain JSON (always so for deferred issuance);
   clients must refuse secret values in that case. The engine decrypts the JWE
   itself, so the engine (and any TLS terminator) sees the values in clear.
-- The engine never logs or persists these values or any extra members. Absent member: no field.
+- The engine never logs or persists these values. Any buffer of completion
+  messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
+  which drops `credential_metadata` and the encrypted flag. Absent member: no
+  field. The same `flow_complete` payload is what `wmp.flow.complete` carries.
 
 Deferred issuance:
 
