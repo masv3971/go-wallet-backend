@@ -561,12 +561,17 @@ to every credential in `credentials[]`; there is no per-credential copy:
   to a seed of exactly 32 lowercase hex characters (privatedata-spec 5A.1). The
   advertisement form (`{"namespaces": [...]}`) in a response is therefore
   rejected, as is uppercase or wrong-length hex.
-- Limits: at most 32 KiB encoded, nesting depth at most 8 (the object itself is
-  depth 1), at most 16 members in any one object, member names at most 256 bytes,
-  and no duplicate member names in any object. A malformed or over-cap value
-  (including `null`, an array or a non-object) fails the issuance with a
-  `CREDENTIAL_ERROR` flow error and no `flow_complete`; it is never dropped
-  silently. Error messages and logs never contain its contents.
+- Limits (abuse caps only, since the object is mostly display metadata such as
+  `display[]`, `logo.uri` data: URIs, `background_image` and `claims[]`): at most
+  1 MiB encoded (room for several embedded data: URI images; the raw HTTP body
+  is capped separately), nesting depth at most 16 (the object itself is depth 1),
+  at most 256 members in any one object, member names at most 256 bytes, and no
+  duplicate member names at the top level or inside `org.siros.secret_seed`
+  (elsewhere the display data is relayed as received). A value over a cap, or
+  `null`, an array or a non-object, fails the issuance with a `CREDENTIAL_ERROR`
+  flow error and no `flow_complete`; it is never dropped silently. Error messages
+  and logs never contain its contents. Only the `org.siros.secret_seed` member
+  is validated strictly (above); everything else is relayed verbatim.
 - `credential_metadata_encrypted_response` is `true` only when the issuer's
   response was JWE-encrypted. When `credential_metadata` is present and this flag
   is absent, the value arrived as plain JSON (always so for deferred issuance);
@@ -597,7 +602,10 @@ to every credential in `credentials[]`; there is no per-credential copy:
   before merging display data.
 - The engine never logs or persists these values. Any buffer of completion
   messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
-  which drops `credential_metadata` and the encrypted flag. Absent member: no
+  which drops the whole `credential_metadata` object (display data included, not
+  only the seed) and the encrypted flag. Only seed delivery requires encryption:
+  a plain response without the seed member and with display-only
+  `credential_metadata` is relayed as usual (flag absent). Absent member: no
   field. The same `flow_complete` payload is what `wmp.flow.complete` carries.
 
 Deferred issuance:

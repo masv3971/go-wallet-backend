@@ -2878,16 +2878,22 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	return results
 }
 
-// Limits for the response-level credential_metadata relay. They bound what an
-// issuer can make the engine relay; legitimate use (a seed or two) is far below
-// them.
+// Limits for the response-level credential_metadata relay. The object is
+// primarily display metadata (display[], locale, logo.uri which the 1.1 draft's
+// own example sets to a data: URI, background_image, claims[]) and is relayed
+// verbatim, so the caps only stop abuse, they must not reject a conformant
+// issuer. Strict validation applies only to org.siros.secret_seed.
 const (
-	maxCredentialMetadataBytes   = 32 * 1024 // whole encoded object
-	maxCredentialMetadataDepth   = 8         // nesting of objects/arrays; the top-level object is depth 1
-	maxCredentialMetadataMembers = 16        // members of any one object
-	maxCredentialMetadataKeyLen  = 256       // bytes of any member name
-	maxSeedNamespaces            = 8         // privatedata-spec 5A.1/5A.4: 1..8 namespaces
-	maxSeedNamespaceBytes        = 64        // privatedata-spec 5A.1: 1..64 UTF-8 bytes
+	// 1 MiB: a few embedded data: URI logos / background images (each typically
+	// tens to a few hundred KiB once base64-encoded) fit comfortably, while a
+	// hostile issuer cannot make the engine relay or buffer megabytes per
+	// response. The raw HTTP body is separately capped at MaxHTTPResponseBodyBytes.
+	maxCredentialMetadataBytes   = 1 << 20
+	maxCredentialMetadataDepth   = 16  // nesting of objects/arrays (display[].logo.* needs about 4); the top-level object is depth 1
+	maxCredentialMetadataMembers = 256 // sanity cap on the members of any one object
+	maxCredentialMetadataKeyLen  = 256 // bytes of any member name
+	maxSeedNamespaces            = 8   // privatedata-spec 5A.1/5A.4: 1..8 namespaces
+	maxSeedNamespaceBytes        = 64  // privatedata-spec 5A.1: 1..64 UTF-8 bytes
 
 	// secretSeedMember is the SIROS extension member of credential_metadata:
 	// {"<namespace>": "<lowercase hex>", ...}.
@@ -3018,12 +3024,17 @@ func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(buf.Bytes()), nil
 }
 
-// checkCredentialMetadataShape walks the token stream enforcing the depth, per-object member, key-length and
-// duplicate-member constraints.
+// checkCredentialMetadataShape walks the token stream enforcing the depth,
+// per-object member and key-length caps everywhere, and rejecting duplicate
+// member names at the top level and inside the org.siros.secret_seed object
+// (elsewhere the object is display data that is relayed as received).
 func checkCredentialMetadataShape(raw json.RawMessage) error {
 	type frame struct {
 		obj       bool
 		expectKey bool
+		members   int
+		lastKey   string
+		unique    bool // duplicate member names rejected: top level and the secret seed object
 		keys      map[string]struct{}
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -3049,7 +3060,12 @@ func checkCredentialMetadataShape(raw json.RawMessage) error {
 				}
 				f := frame{obj: d == '{', expectKey: d == '{'}
 				if f.obj {
-					f.keys = map[string]struct{}{}
+					top := len(stack) == 0
+					seed := len(stack) == 1 && stack[0].obj && stack[0].lastKey == secretSeedMember
+					if top || seed {
+						f.unique = true
+						f.keys = map[string]struct{}{}
+					}
 				}
 				stack = append(stack, f)
 			default:
@@ -3064,11 +3080,15 @@ func checkCredentialMetadataShape(raw json.RawMessage) error {
 			if len(key) > maxCredentialMetadataKeyLen {
 				return fmt.Errorf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
 			}
-			if _, dup := stack[n-1].keys[key]; dup {
-				return errors.New("credential_metadata has a duplicate member name")
+			if stack[n-1].unique {
+				if _, dup := stack[n-1].keys[key]; dup {
+					return errors.New("credential_metadata has a duplicate member name")
+				}
+				stack[n-1].keys[key] = struct{}{}
 			}
-			stack[n-1].keys[key] = struct{}{}
-			if len(stack[n-1].keys) > maxCredentialMetadataMembers {
+			stack[n-1].lastKey = key
+			stack[n-1].members++
+			if stack[n-1].members > maxCredentialMetadataMembers {
 				return fmt.Errorf("credential_metadata object has more than %d members", maxCredentialMetadataMembers)
 			}
 			stack[n-1].expectKey = false

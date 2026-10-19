@@ -87,6 +87,8 @@ func TestCredentialMetadataRelay_ValidShapes(t *testing.T) {
 		"max key length":           `{"` + strings.Repeat("k", maxCredentialMetadataKeyLen) + `":1}`,
 		"max seed namespaces":      `{"org.siros.secret_seed":{` + seedNS(maxSeedNamespaces, maxSeedNamespaceBytes) + `}}`,
 		"same key in separate obj": `{"a":{"x":1},"b":{"x":2}}`,
+		"nested duplicate names":   `{"display":[{"name":"a","name":"b"}]}`,
+		"display data with logo":   `{"display":[{"name":"A","locale":"en","logo":{"uri":"data:image/png;base64,AAAA","alt_text":"x"},"background_image":{"uri":"data:image/png;base64,BBBB"}}],"claims":[{"path":["a"],"display":[{"name":"A"}]}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := credentialMetadataRelay(parseResp(t, bodyWithMD(md)))
@@ -673,4 +675,61 @@ func TestLogIgnoredCredentialConfigurations_MalformedSeedAdvertisementNoContent(
 	for _, f := range e.Context {
 		assert.NotContains(t, f.String, secretSeedA)
 	}
+}
+
+func TestCredentialMetadataRelay_DisplayDataWithLargeDataURIAndSeed(t *testing.T) {
+	logo := "data:image/png;base64," + strings.Repeat("QUJD", 50*1024) // ~200 KB
+	require.Greater(t, len(logo), 200*1000)
+	md := `{"display":[{"name":"Nym","locale":"en","logo":{"uri":"` + logo + `","alt_text":"logo"}}],` +
+		`"org.siros.secret_seed":{"org.siros.nym_auth":"` + secretSeedA + `"}}`
+	resp := parseResp(t, bodyWithMD(md))
+	resp.Encrypted = true
+	relay, err := credentialMetadataRelay(resp)
+	require.NoError(t, err)
+	assert.Equal(t, md, string(relay.Metadata), "relayed verbatim")
+
+	// And all the way out on flow_complete.
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	require.NoError(t, h.finishIssuance(context.Background(), StepRequestingCredential, resp, &CredentialConfig{Format: "mso_mdoc"}, nil, nil, &TokenResponse{}))
+	m := nextMsg(t, ch)
+	assert.JSONEq(t, `"flow_complete"`, string(m["type"]))
+	assert.Equal(t, md, string(m["credential_metadata"]))
+}
+
+func TestCredentialMetadataRelay_SizeBoundary(t *testing.T) {
+	pad := func(total int) string {
+		const frame = `{"x":""}`
+		return `{"x":"` + strings.Repeat("p", total-len(frame)) + `"}`
+	}
+	at := pad(maxCredentialMetadataBytes)
+	require.Len(t, at, maxCredentialMetadataBytes)
+	_, err := credentialMetadataRelay(parseResp(t, bodyWithMD(at)))
+	require.NoError(t, err, "exactly at the cap passes")
+	over := pad(maxCredentialMetadataBytes + 1)
+	relay, err := credentialMetadataRelay(parseResp(t, bodyWithMD(over)))
+	require.Error(t, err)
+	assert.Nil(t, relay)
+}
+
+func TestFinishIssuance_PlainDisplayOnlyMetadataRelayed(t *testing.T) {
+	md := `{"display":[{"name":"A","locale":"en","logo":{"uri":"data:image/png;base64,AAAA"}}],"claims":[]}`
+	for _, cfg := range []*CredentialConfig{seedCfg(""), seedCfg(advOK)} {
+		h, ch, cleanup := captureHandler(t)
+		require.NoError(t, h.finishIssuance(context.Background(), StepRequestingCredential, parseResp(t, bodyWithMD(md)), cfg, nil, nil, &TokenResponse{}))
+		m := nextMsg(t, ch)
+		assert.Equal(t, md, string(m["credential_metadata"]))
+		_, flag := m["credential_metadata_encrypted_response"]
+		assert.False(t, flag)
+		cleanup()
+	}
+}
+
+func TestFinishIssuance_OversizeMetadataFailsCleanly(t *testing.T) {
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	md := `{"x":"` + strings.Repeat("p", maxCredentialMetadataBytes) + `"}`
+	require.Error(t, h.finishIssuance(context.Background(), StepRequestingCredential, parseResp(t, bodyWithMD(md)), seedCfg(""), nil, nil, &TokenResponse{}))
+	m := nextMsg(t, ch)
+	assert.JSONEq(t, `"flow_error"`, string(m["type"]))
 }
