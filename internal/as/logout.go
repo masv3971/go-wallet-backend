@@ -42,7 +42,7 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, blacklist TokenBlack
 			return
 		}
 
-		if blacklist != nil && sessErr == nil && session != nil {
+		if blacklist != nil && session != nil {
 			if bearerToken := extractBearerToken(c); bearerToken != "" {
 				blacklistOwnBearerToken(c, bearerToken, session.UserID, issuer, blacklist, logger)
 			}
