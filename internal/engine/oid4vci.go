@@ -3031,27 +3031,101 @@ func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
 	return json.RawMessage(buf.Bytes()), nil
 }
 
+// shapeFrame is one open object or array while walking credential_metadata.
+type shapeFrame struct {
+	obj       bool
+	expectKey bool
+	members   int
+	lastKey   string
+	unique    bool // duplicate member names rejected: top level and the secret seed object
+	keys      map[string]struct{}
+}
+
+// shapeWalker tracks the open containers of a credential_metadata token stream.
+type shapeWalker struct {
+	stack []shapeFrame
+}
+
+// valueDone marks the enclosing object (if any) as ready for its next key.
+func (w *shapeWalker) valueDone() {
+	if n := len(w.stack); n > 0 && w.stack[n-1].obj {
+		w.stack[n-1].expectKey = true
+	}
+}
+
+// open pushes a container, enforcing the depth cap and selecting the objects
+// whose member names must be unique (top level and the secret seed object).
+func (w *shapeWalker) open(d json.Delim) error {
+	if len(w.stack)+1 > maxCredentialMetadataDepth {
+		return fmt.Errorf("credential_metadata nests deeper than %d", maxCredentialMetadataDepth)
+	}
+	f := shapeFrame{obj: d == '{', expectKey: d == '{'}
+	if f.obj {
+		top := len(w.stack) == 0
+		seed := len(w.stack) == 1 && w.stack[0].obj && w.stack[0].lastKey == secretSeedMember
+		if top || seed {
+			f.unique = true
+			f.keys = map[string]struct{}{}
+		}
+	}
+	w.stack = append(w.stack, f)
+	return nil
+}
+
+// expectingKey reports whether the next non-delimiter token is a member name.
+func (w *shapeWalker) expectingKey() bool {
+	n := len(w.stack)
+	return n > 0 && w.stack[n-1].obj && w.stack[n-1].expectKey
+}
+
+// key records a member name of the innermost object, enforcing the key-length,
+// uniqueness and member-count caps.
+func (w *shapeWalker) key(key string) error {
+	f := &w.stack[len(w.stack)-1]
+	if len(key) > maxCredentialMetadataKeyLen {
+		return fmt.Errorf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
+	}
+	if f.unique {
+		if _, dup := f.keys[key]; dup {
+			return errors.New("credential_metadata has a duplicate member name")
+		}
+		f.keys[key] = struct{}{}
+	}
+	f.lastKey = key
+	f.members++
+	if f.members > maxCredentialMetadataMembers {
+		return fmt.Errorf("credential_metadata object has more than %d members", maxCredentialMetadataMembers)
+	}
+	f.expectKey = false
+	return nil
+}
+
+// token consumes one token of the stream.
+func (w *shapeWalker) token(tok json.Token) error {
+	if d, ok := tok.(json.Delim); ok {
+		if d == '{' || d == '[' {
+			return w.open(d)
+		}
+		w.stack = w.stack[:len(w.stack)-1]
+		w.valueDone()
+		return nil
+	}
+	if w.expectingKey() {
+		key, _ := tok.(string)
+		return w.key(key)
+	}
+	w.valueDone()
+	return nil
+}
+
 // checkCredentialMetadataShape walks the token stream enforcing the depth,
 // per-object member and key-length caps everywhere, and rejecting duplicate
 // member names at the top level and inside the org.siros.secret_seed object
 // (elsewhere the object is display data that is relayed as received).
 func checkCredentialMetadataShape(raw json.RawMessage) error {
-	type frame struct {
-		obj       bool
-		expectKey bool
-		members   int
-		lastKey   string
-		unique    bool // duplicate member names rejected: top level and the secret seed object
-		keys      map[string]struct{}
-	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber() // numbers are relayed verbatim; no float64 range limit (1e400)
-	var stack []frame
-	valueDone := func() {
-		if n := len(stack); n > 0 && stack[n-1].obj {
-			stack[n-1].expectKey = true
-		}
-	}
+	var w shapeWalker
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -3060,51 +3134,11 @@ func checkCredentialMetadataShape(raw json.RawMessage) error {
 		if err != nil {
 			return errors.New("credential_metadata is not valid JSON")
 		}
-		if d, ok := tok.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				if len(stack)+1 > maxCredentialMetadataDepth {
-					return fmt.Errorf("credential_metadata nests deeper than %d", maxCredentialMetadataDepth)
-				}
-				f := frame{obj: d == '{', expectKey: d == '{'}
-				if f.obj {
-					top := len(stack) == 0
-					seed := len(stack) == 1 && stack[0].obj && stack[0].lastKey == secretSeedMember
-					if top || seed {
-						f.unique = true
-						f.keys = map[string]struct{}{}
-					}
-				}
-				stack = append(stack, f)
-			default:
-				stack = stack[:len(stack)-1]
-				valueDone()
-			}
-			continue
+		if err := w.token(tok); err != nil {
+			return err
 		}
-		n := len(stack)
-		if n > 0 && stack[n-1].obj && stack[n-1].expectKey {
-			key, _ := tok.(string)
-			if len(key) > maxCredentialMetadataKeyLen {
-				return fmt.Errorf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
-			}
-			if stack[n-1].unique {
-				if _, dup := stack[n-1].keys[key]; dup {
-					return errors.New("credential_metadata has a duplicate member name")
-				}
-				stack[n-1].keys[key] = struct{}{}
-			}
-			stack[n-1].lastKey = key
-			stack[n-1].members++
-			if stack[n-1].members > maxCredentialMetadataMembers {
-				return fmt.Errorf("credential_metadata object has more than %d members", maxCredentialMetadataMembers)
-			}
-			stack[n-1].expectKey = false
-			continue
-		}
-		valueDone()
 	}
-	if len(stack) != 0 {
+	if len(w.stack) != 0 {
 		return errors.New("credential_metadata is not valid JSON")
 	}
 	return nil
