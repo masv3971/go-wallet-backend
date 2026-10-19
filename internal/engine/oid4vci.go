@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -349,6 +350,40 @@ type CredentialResponse struct {
 	// credential_response_encryption) and was decrypted by us. It is local
 	// state, never part of the wire format.
 	Encrypted bool `json:"-"`
+
+	// credentialMetadataRaw holds, by index into Credentials, the raw JSON of
+	// each element's credential_metadata member exactly as received (see
+	// UnmarshalJSON), so relayed entries keep number spelling and member order
+	// instead of round-tripping through interface{}/float64.
+	credentialMetadataRaw map[int]json.RawMessage
+}
+
+// UnmarshalJSON decodes the response and additionally captures the raw bytes
+// of each credentials[] element's credential_metadata member.
+func (r *CredentialResponse) UnmarshalJSON(b []byte) error {
+	type plain CredentialResponse // no methods: avoids recursion
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	var rawElems struct {
+		Credentials []json.RawMessage `json:"credentials"`
+	}
+	if err := json.Unmarshal(b, &rawElems); err == nil {
+		for i, e := range rawElems.Credentials {
+			var m struct {
+				CredentialMetadata json.RawMessage `json:"credential_metadata"`
+			}
+			if json.Unmarshal(e, &m) == nil && m.CredentialMetadata != nil {
+				if p.credentialMetadataRaw == nil {
+					p.credentialMetadataRaw = make(map[int]json.RawMessage)
+				}
+				p.credentialMetadataRaw[i] = m.CredentialMetadata
+			}
+		}
+	}
+	*r = CredentialResponse(p)
+	return nil
 }
 
 // AvailableCredential represents a credential available for selection
@@ -2808,7 +2843,7 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	// (which may be a string or a wrapped object) and appends it. Per OID4VCI
 	// §8.3/§11 there is a single notification_id per Credential Response, so the
 	// same resp.NotificationID applies to every credential in the response.
-	appendResult := func(cred interface{}, withMetadata bool) {
+	appendResult := func(cred interface{}, idx int) {
 		res := CredentialResult{
 			Format:         config.Format,
 			Credential:     credentialToString(cred),
@@ -2816,26 +2851,24 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 			TypeMetadata:   typeMetadata,
 			NotificationID: resp.NotificationID,
 		}
-		if withMetadata {
-			if m, ok := cred.(map[string]interface{}); ok {
-				if raw, present := m["credential_metadata"]; present {
-					entries, err := parseCredentialMetadata(raw)
-					if err != nil && buildErr == nil {
-						buildErr = fmt.Errorf("credentials[%d]: %w", len(results), err)
-					}
-					res.CredentialMetadata = entries
-					res.CredentialMetadataEncryptedResponse = len(entries) > 0 && resp.Encrypted
+		if idx >= 0 {
+			if raw, present := credentialMetadataBytes(resp, idx, cred); present {
+				entries, err := parseCredentialMetadata(raw)
+				if err != nil && buildErr == nil {
+					buildErr = fmt.Errorf("credentials[%d]: %w", len(results), err)
 				}
+				res.CredentialMetadata = entries
+				res.CredentialMetadataEncryptedResponse = len(entries) > 0 && resp.Encrypted
 			}
 		}
 		results = append(results, res)
 	}
 
 	if resp.Credential != nil {
-		appendResult(resp.Credential, false)
+		appendResult(resp.Credential, -1)
 	}
-	for _, cred := range resp.Credentials {
-		appendResult(cred, true)
+	for i, cred := range resp.Credentials {
+		appendResult(cred, i)
 	}
 
 	if buildErr != nil {
@@ -2850,17 +2883,37 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 const (
 	maxCredentialMetadataEntries    = 16
 	maxCredentialMetadataTypeBytes  = 256
-	maxCredentialMetadataValueBytes = 8 * 1024
+	maxCredentialMetadataEntryBytes = 8 * 1024 // whole entry, extra members included
 	maxCredentialMetadataTotalBytes = 32 * 1024
 )
 
+// credentialMetadataBytes returns the raw credential_metadata of credentials[idx]:
+// the bytes captured at decode time when available, else (responses built in
+// code rather than decoded) the re-marshaled map member.
+func credentialMetadataBytes(resp *CredentialResponse, idx int, cred interface{}) (json.RawMessage, bool) {
+	if raw, ok := resp.credentialMetadataRaw[idx]; ok {
+		return raw, true
+	}
+	if m, ok := cred.(map[string]interface{}); ok {
+		if v, present := m["credential_metadata"]; present {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return json.RawMessage("null"), true // fails validation
+			}
+			return b, true
+		}
+	}
+	return nil, false
+}
+
 // parseCredentialMetadata validates the per-credential credential_metadata
-// extension: an array of {"type": <non-empty string>, "value": <non-null>}
-// objects with no other members. Error messages never include values, since
-// they may be secrets.
-func parseCredentialMetadata(raw interface{}) ([]CredentialMetadataEntry, error) {
-	arr, ok := raw.([]interface{})
-	if !ok {
+// extension: an array of JSON objects, each with a non-empty string "type"
+// and a present, non-null "value". Any other member is accepted and relayed
+// as received. Error messages never include entry contents (they may be
+// secrets).
+func parseCredentialMetadata(raw json.RawMessage) ([]CredentialMetadataEntry, error) {
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err != nil || arr == nil {
 		return nil, errors.New("credential_metadata is not an array")
 	}
 	if len(arr) > maxCredentialMetadataEntries {
@@ -2869,38 +2922,29 @@ func parseCredentialMetadata(raw interface{}) ([]CredentialMetadataEntry, error)
 	var entries []CredentialMetadataEntry
 	total := 0
 	for i, e := range arr {
-		obj, ok := e.(map[string]interface{})
-		if !ok {
+		if len(e) > maxCredentialMetadataEntryBytes {
+			return nil, fmt.Errorf("credential_metadata[%d] exceeds %d bytes", i, maxCredentialMetadataEntryBytes)
+		}
+		total += len(e)
+		if total > maxCredentialMetadataTotalBytes {
+			return nil, fmt.Errorf("credential_metadata exceeds %d bytes in total", maxCredentialMetadataTotalBytes)
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(e, &members); err != nil || members == nil {
 			return nil, fmt.Errorf("credential_metadata[%d] is not an object", i)
 		}
-		for k := range obj {
-			if k != "type" && k != "value" {
-				return nil, fmt.Errorf("credential_metadata[%d] has an unexpected member", i)
-			}
-		}
-		typ, ok := obj["type"].(string)
-		if !ok || typ == "" {
+		var typ string
+		if err := json.Unmarshal(members["type"], &typ); err != nil || typ == "" {
 			return nil, fmt.Errorf("credential_metadata[%d] has no non-empty string type", i)
 		}
 		if len(typ) > maxCredentialMetadataTypeBytes {
 			return nil, fmt.Errorf("credential_metadata[%d] type exceeds %d bytes", i, maxCredentialMetadataTypeBytes)
 		}
-		val, present := obj["value"]
-		if !present || val == nil {
+		val, present := members["value"]
+		if !present || string(bytes.TrimSpace(val)) == "null" {
 			return nil, fmt.Errorf("credential_metadata[%d] has no value", i)
 		}
-		vb, err := json.Marshal(val)
-		if err != nil {
-			return nil, fmt.Errorf("credential_metadata[%d] value is not serializable", i)
-		}
-		if len(vb) > maxCredentialMetadataValueBytes {
-			return nil, fmt.Errorf("credential_metadata[%d] value exceeds %d bytes", i, maxCredentialMetadataValueBytes)
-		}
-		total += len(typ) + len(vb)
-		if total > maxCredentialMetadataTotalBytes {
-			return nil, fmt.Errorf("credential_metadata exceeds %d bytes in total", maxCredentialMetadataTotalBytes)
-		}
-		entries = append(entries, CredentialMetadataEntry{Type: typ, Value: vb})
+		entries = append(entries, CredentialMetadataEntry{Type: typ, Value: val, raw: append(json.RawMessage(nil), e...)})
 	}
 	return entries, nil
 }

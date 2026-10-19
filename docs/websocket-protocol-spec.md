@@ -547,19 +547,26 @@ carries a `credential_metadata` member next to `credential` in an element of
 }
 ```
 
-- Each entry is an object with exactly a non-empty string `type` and a non-null
-  `value` (any JSON value). Not the OID4VCI issuer-metadata display object, nor
-  OID4VCI 1.1's response-level `credential_metadata`; those are not read.
+- Each entry is an object with a non-empty string `type` (at most 256 bytes) and
+  a present, non-null `value` (any JSON value). Any other member is accepted and
+  relayed as received (name and value untouched). Not the OID4VCI issuer-metadata
+  display object, nor OID4VCI 1.1's response-level `credential_metadata`; those
+  are not read.
+- Fidelity: entries are taken from the raw response bytes, not via a generic
+  decode, so member names, member order and number spelling (`1.50`, `2.0`,
+  integers beyond float64) are preserved. Not byte-exact: insignificant
+  whitespace is removed and the JSON encoder may write `<`, `>`, `&` as `\u`
+  escapes (value-identical). Duplicate member names are not specially handled.
 - Limits: at most 16 entries per credential, `type` at most 256 bytes, each
-  serialized `value` at most 8 KiB, 32 KiB total per credential. A malformed or
-  oversized member fails the issuance with a `CREDENTIAL_ERROR` flow error; it
-  is never dropped silently.
+  whole entry (extra members included) at most 8 KiB, 32 KiB total per
+  credential. A malformed or oversized member fails the issuance with a
+  `CREDENTIAL_ERROR` flow error; it is never dropped silently.
 - `credential_metadata_encrypted_response` is `true` only when the issuer's
   response was JWE-encrypted. When `credential_metadata` is present and this flag
   is absent, the value arrived as plain JSON (always so for deferred issuance);
   clients must refuse secret values in that case. The engine decrypts the JWE
   itself, so the engine (and any TLS terminator) sees the values in clear.
-- The engine never logs or persists these values. Absent member: no field.
+- The engine never logs or persists these values or any extra members. Absent member: no field.
 
 Deferred issuance:
 

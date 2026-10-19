@@ -599,11 +599,42 @@ type CredentialResult struct {
 	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
 }
 
-// CredentialMetadataEntry is one {"type","value"} entry of the per-credential
-// credential_metadata extension. Value is any JSON value except null.
+// CredentialMetadataEntry is one entry of the per-credential credential_metadata
+// extension: an object with a non-empty string "type", a non-null "value" and
+// any further members, which are relayed untouched. Type and Value are
+// conveniences for Go consumers; the wire form is the entry as received
+// (member names, order and number spelling preserved; insignificant whitespace
+// removed and <, >, & possibly \u-escaped by the JSON encoder, which is
+// value-identical). Extra members are untrusted data and may carry secrets.
 type CredentialMetadataEntry struct {
-	Type  string          `json:"type"`
-	Value json.RawMessage `json:"value"`
+	Type  string
+	Value json.RawMessage
+
+	raw json.RawMessage // entry as received; nil for entries built in code
+}
+
+// MarshalJSON emits the entry as received, or {"type","value"} when built in code.
+func (e CredentialMetadataEntry) MarshalJSON() ([]byte, error) {
+	if len(e.raw) > 0 {
+		return e.raw, nil
+	}
+	return json.Marshal(struct {
+		Type  string          `json:"type"`
+		Value json.RawMessage `json:"value"`
+	}{e.Type, e.Value})
+}
+
+// UnmarshalJSON keeps the entry's raw bytes alongside Type and Value.
+func (e *CredentialMetadataEntry) UnmarshalJSON(b []byte) error {
+	var v struct {
+		Type  string          `json:"type"`
+		Value json.RawMessage `json:"value"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	e.Type, e.Value, e.raw = v.Type, v.Value, append(json.RawMessage(nil), b...)
+	return nil
 }
 
 // TrustInfo contains trust evaluation results.
