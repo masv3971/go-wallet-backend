@@ -21,7 +21,12 @@ services:
       as-key-init:
         condition: service_completed_successfully
     ports:
-      - "8002:8080"
+      # Host port must match the port in as.external_url (configs/config.yaml,
+      # http://localhost:8080): that URL also forms the browser-facing OIDC
+      # callback (<external_url>/auth/oidc/callback). If you publish a different
+      # host port or hostname, change as.external_url to match, and keep the AS
+      # JWKS URL reachable from inside the container.
+      - "8080:8080"
     volumes:
       # The whole directory, not single files: a file bind mount whose source does
       # not exist yet (the key, on a clean checkout) is created as a directory.

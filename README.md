@@ -176,6 +176,11 @@ openssl ecparam -name prime256v1 -genkey -noout -out configs/as-signing-key.pem
 docker compose up   # generates configs/as-signing-key.pem on first run
 ```
 
+Compose publishes the backend on `localhost:8080`, matching `as.external_url`
+in `configs/config.yaml`. That URL also forms the browser-facing OIDC callback
+(`<external_url>/auth/oidc/callback`), so if you change the published port or
+host, change `as.external_url` too.
+
 ### Configuration
 
 Configuration can be provided via:
