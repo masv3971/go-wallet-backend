@@ -615,7 +615,6 @@ type IssuerRequest struct {
 	CredentialIssuerIdentifier string  `json:"credential_issuer_identifier" binding:"required"`
 	ClientID                   string  `json:"client_id,omitempty"`
 	ClientJWK                  *string `json:"client_jwk,omitempty"`
-	RedirectURI                string  `json:"redirect_uri,omitempty"`
 	Visible                    *bool   `json:"visible,omitempty"`
 }
 
@@ -625,7 +624,6 @@ type IssuerResponse struct {
 	TenantID                   string  `json:"tenant_id"`
 	CredentialIssuerIdentifier string  `json:"credential_issuer_identifier"`
 	ClientID                   string  `json:"client_id,omitempty"`
-	RedirectURI                string  `json:"redirect_uri,omitempty"`
 	HasClientJWK               bool    `json:"has_client_jwk"`
 	Visible                    bool    `json:"visible"`
 	TrustStatus                string  `json:"trust_status,omitempty"`
@@ -639,7 +637,6 @@ func issuerToResponse(i *domain.CredentialIssuer) *IssuerResponse {
 		TenantID:                   string(i.TenantID),
 		CredentialIssuerIdentifier: i.CredentialIssuerIdentifier,
 		ClientID:                   i.ClientID,
-		RedirectURI:                i.RedirectURI,
 		HasClientJWK:               i.ClientJWK != "",
 		Visible:                    i.Visible,
 		TrustStatus:                string(i.TrustStatus),
@@ -749,7 +746,6 @@ func (h *AdminHandlers) CreateIssuer(c *gin.Context) {
 		TenantID:                   tenantID,
 		CredentialIssuerIdentifier: req.CredentialIssuerIdentifier,
 		ClientID:                   req.ClientID,
-		RedirectURI:                req.RedirectURI,
 		Visible:                    visible,
 	}
 	if req.ClientJWK != nil {
@@ -802,7 +798,6 @@ func (h *AdminHandlers) UpdateIssuer(c *gin.Context) {
 	// Update fields
 	issuer.CredentialIssuerIdentifier = req.CredentialIssuerIdentifier
 	issuer.ClientID = req.ClientID
-	issuer.RedirectURI = req.RedirectURI
 	if req.ClientJWK != nil {
 		issuer.ClientJWK = *req.ClientJWK
 	}

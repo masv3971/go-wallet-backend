@@ -457,14 +457,8 @@ func (m *Manager) handleSession(session *Session) {
 	for {
 		_, message, err := session.conn.ReadMessage()
 		if err != nil {
-			if closeErr, ok := err.(*websocket.CloseError); ok {
-				session.logger.Info("WebSocket closed by client",
-					zap.Int("code", closeErr.Code),
-					zap.String("reason", closeErr.Text))
-			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				session.logger.Error("Read error", zap.Error(err))
-			} else {
-				session.logger.Info("WebSocket read ended", zap.Error(err))
 			}
 			return
 		}

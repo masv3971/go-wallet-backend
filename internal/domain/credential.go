@@ -99,7 +99,6 @@ type CredentialIssuer struct {
 	CredentialIssuerIdentifier string      `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
 	ClientID                   string      `json:"clientId,omitempty" bson:"client_id"`
 	ClientJWK                  string      `json:"clientJwk,omitempty" bson:"client_jwk" gorm:"column:client_jwk"`
-	RedirectURI                string      `json:"redirectUri,omitempty" bson:"redirect_uri"`
 	Visible                    bool        `json:"visible" bson:"visible"`
 	TrustStatus                TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
 	TrustFramework             string      `json:"trustFramework,omitempty" bson:"trust_framework"`
