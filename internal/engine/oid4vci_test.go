@@ -2189,6 +2189,34 @@ func TestResumeWithAuthCode_MissingRedirectURI(t *testing.T) {
 	assert.Contains(t, err.Error(), "redirect_uri is required")
 }
 
+func TestResumeWithAuthCode_HandlerRedirectURITakesPrecedence(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		assert.Equal(t, "https://registered.example.com/cb", r.FormValue("redirect_uri"),
+			"registered redirect_uri (set on handler) must override the message value")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(TokenResponse{AccessToken: "tok", TokenType: "Bearer"})
+	}))
+	defer tokenServer.Close()
+
+	h, cleanup := testOID4VCIHandler(t, tokenServer.Client())
+	defer cleanup()
+	h.redirectURI = "https://registered.example.com/cb"
+
+	metadata := &IssuerMetadata{
+		CredentialIssuer: "https://issuer.example.com",
+		TokenEndpoint:    tokenServer.URL,
+	}
+	msg := &FlowStartMessage{
+		AuthCode:     "test-auth-code",
+		CodeVerifier: "test-verifier",
+		RedirectURI:  "https://stale-frontend.example.com/cb",
+	}
+
+	_, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
+	require.NoError(t, err)
+}
+
 func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) {
 	// OAuth metadata server returns token endpoint
 	var tokenRequested bool

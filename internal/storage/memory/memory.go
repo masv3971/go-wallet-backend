@@ -244,7 +244,8 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 	user.CreatedAt = time.Now()
 	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
+	// Store a private copy so callers cannot mutate shared state.
+	s.data[user.UUID.String()] = user.Clone()
 	return nil
 }
 
@@ -256,7 +257,7 @@ func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
-	return user, nil
+	return user.Clone(), nil
 }
 
 func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain.User, error) {
@@ -265,7 +266,7 @@ func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain
 
 	for _, user := range s.data {
 		if user.Username != nil && *user.Username == username {
-			return user, nil
+			return user.Clone(), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -277,23 +278,47 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 	for _, user := range s.data {
 		if user.DID == did {
-			return user, nil
+			return user.Clone(), nil
 		}
 	}
 	return nil, storage.ErrNotFound
 }
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
+	snapshot := user.Clone()
+	stored, err := s.Modify(ctx, user.UUID, func(u *domain.User) error {
+		version := u.Version
+		*u = *snapshot.Clone()
+		u.Version = version
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	user.UpdatedAt = stored.UpdatedAt
+	user.Version = stored.Version
+	return nil
+}
+
+// Modify atomically applies fn to the stored user while holding the write lock.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[user.UUID.String()]; !exists {
-		return storage.ErrNotFound
+	current, exists := s.data[id.String()]
+	if !exists {
+		return nil, storage.ErrNotFound
 	}
 
-	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
-	return nil
+	working := current.Clone()
+	if err := fn(working); err != nil {
+		return nil, err
+	}
+	working.UUID = current.UUID
+	working.Version = current.Version + 1
+	working.UpdatedAt = time.Now()
+	s.data[id.String()] = working
+	return working.Clone(), nil
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -305,24 +330,6 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	}
 
 	delete(s.data, id.String())
-	return nil
-}
-
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	user, exists := s.data[id.String()]
-	if !exists {
-		return storage.ErrNotFound
-	}
-
-	// Check ETag for optimistic locking
-	if ifMatch != "" && user.PrivateDataETag != ifMatch {
-		return storage.ErrInvalidInput
-	}
-
-	user.UpdatePrivateData(data)
 	return nil
 }
 

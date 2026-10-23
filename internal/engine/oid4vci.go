@@ -575,6 +575,20 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		)
 	}
 
+	// Override redirect_uri with registered value when available.
+	// The registered redirect_uri is authoritative and must match the issuer's
+	// client configuration, preventing mismatches from stale browser state.
+	if r := metaResult.RegisteredIssuer; r != nil && r.RedirectURI != "" {
+		if h.redirectURI != r.RedirectURI {
+			h.Logger.Info("overriding redirect_uri with registered value",
+				zap.String("frontend_redirect_uri", h.redirectURI),
+				zap.String("registered_redirect_uri", r.RedirectURI),
+				zap.String("issuer", offer.CredentialIssuer),
+			)
+		}
+		h.redirectURI = r.RedirectURI
+	}
+
 	// Parse client JWK for private_key_jwt authentication if registered
 	if r := metaResult.RegisteredIssuer; r != nil && r.ClientJWK != "" {
 		key, kid, err := parseECPrivateKeyJWK(r.ClientJWK)
@@ -1567,7 +1581,12 @@ func (h *OID4VCIHandler) exchangeAuthCode(ctx context.Context, metadata *IssuerM
 // and returned with an authorization code. This function skips authorization URL
 // generation and directly exchanges the auth code for a token.
 func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartMessage, metadata *IssuerMetadata) (*TokenResponse, error) {
-	h.Logger.Info("Resuming OID4VCI flow with authorization code")
+	h.Logger.Info("Resuming OID4VCI flow with authorization code",
+		zap.String("msg_redirect_uri", msg.RedirectURI),
+		zap.String("h_redirect_uri", h.redirectURI),
+		zap.Bool("has_auth_code", msg.AuthCode != ""),
+		zap.Bool("has_code_verifier", msg.CodeVerifier != ""),
+	)
 	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
 
 	// Fetch OAuth metadata to get token endpoint and check PKCE requirements
@@ -1586,8 +1605,12 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 		return nil, errors.New("code_verifier is required for flow resumption")
 	}
 
-	// Use redirect URI from message
-	redirectURI := msg.RedirectURI
+	// Prefer the handler's redirect URI (set in Execute and possibly overridden
+	// by the registered issuer config); fall back to the one in the message.
+	redirectURI := h.redirectURI
+	if redirectURI == "" {
+		redirectURI = msg.RedirectURI
+	}
 	if redirectURI == "" {
 		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "redirect_uri is required for flow resumption")
 		return nil, errors.New("redirect_uri is required for flow resumption")
