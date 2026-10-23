@@ -9,14 +9,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
+	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/embed"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
@@ -29,6 +29,12 @@ type Handlers struct {
 	roles         []string
 	metadataCache *issuerMetadataCache
 	httpClient    *http.Client
+
+	// imageEmbedder inlines remote images referenced by an issuer's own
+	// metadata as data: URIs before the response is handed to a client. It
+	// does not change WHAT the issuer says about its credentials - only how
+	// the assets it points at are delivered. See embedIssuerMetadataImages.
+	imageEmbedder *embed.ImageEmbedder
 }
 
 // NewHandlers creates a new Handlers instance
@@ -40,6 +46,7 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
+		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
 }
 
@@ -53,6 +60,7 @@ func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *
 		roles:         roles,
 		metadataCache: newIssuerMetadataCache(),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
+		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
 }
 
@@ -78,276 +86,36 @@ func (h *Handlers) Status(c *gin.Context) {
 	})
 }
 
-// WebAuthn handlers
-
-// StartWebAuthnRegistration begins the WebAuthn registration process
-// Tenant is taken from X-Tenant-ID header (set by TenantHeaderMiddleware)
-func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.BeginRegistrationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		// Allow empty body - all fields are optional
-		req = service.BeginRegistrationRequest{}
-	}
-
-	// Get tenant from header (set by TenantHeaderMiddleware for this unauthenticated endpoint)
-	tenantID, _ := h.getTenantID(c)
-	req.TenantID = string(tenantID)
-
-	resp, err := h.services.WebAuthn.BeginRegistration(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Error("Failed to start WebAuthn registration", zap.Error(err))
-		if errors.Is(err, service.ErrTenantNotFound) {
-			c.JSON(404, gin.H{"error": "Tenant not found"})
-			return
-		}
-		if errors.Is(err, service.ErrInviteRequired) {
-			c.JSON(403, gin.H{"error": "invite_required"})
-			return
-		}
-		if errors.Is(err, service.ErrInvalidInvite) {
-			c.JSON(403, gin.H{"error": "invite_invalid"})
-			return
-		}
-		c.JSON(500, gin.H{"error": "Failed to start registration"})
-		return
-	}
-
-	c.JSON(200, resp)
-}
-
-// FinishWebAuthnRegistration completes the WebAuthn registration process
-func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.FinishRegistrationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	// SECURITY: Check if identity binding is required for this tenant
-	// This must be validated BEFORE checking oidcResult to prevent bypass
-	tenantVal, tenantExists := c.Get("tenant")
-	var tenant *domain.Tenant
-	if tenantExists {
-		tenant, _ = tenantVal.(*domain.Tenant)
-	}
-
-	// If bind_identity is configured, we MUST have both tenant and OIDC result
-	if tenant != nil && tenant.OIDCGate.BindIdentity {
-		// bind_identity requires registration mode - enforce binding
-		oidcResult, hasResult := middleware.GetOIDCGateResultGin(c)
-		if !hasResult {
-			h.logger.Error("bind_identity enabled but no OIDC result in context",
-				zap.String("tenant_id", string(tenant.ID)))
-			c.JSON(500, gin.H{"error": "OIDC gate state inconsistent"})
-			return
-		}
-
-		// SECURITY: Verify issuer matches tenant's configured RegistrationOP
-		regOP := tenant.OIDCGate.GetRegistrationOP()
-		if regOP == nil {
-			h.logger.Error("bind_identity enabled but no RegistrationOP configured",
-				zap.String("tenant_id", string(tenant.ID)))
-			c.JSON(500, gin.H{"error": "OIDC gate misconfigured"})
-			return
-		}
-		if oidcResult.Issuer != regOP.Issuer {
-			h.logger.Warn("OIDC issuer mismatch during registration binding",
-				zap.String("tenant_id", string(tenant.ID)),
-				zap.String("expected_issuer", regOP.Issuer),
-				zap.String("actual_issuer", oidcResult.Issuer))
-			c.JSON(401, gin.H{
-				"error": "OIDC issuer mismatch",
-				"code":  "oidc_issuer_mismatch",
-			})
-			return
-		}
-
-		// Get email from claims if available
-		var email string
-		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-			email = emailClaim
-		}
-		req.OIDCGateBinding = &service.OIDCGateBinding{
-			Issuer:      oidcResult.Issuer,
-			Subject:     oidcResult.Subject,
-			Email:       email,
-			BindingType: "registration",
-		}
-		h.logger.Debug("OIDC identity binding prepared for registration",
-			zap.String("issuer", oidcResult.Issuer),
-			zap.String("subject", oidcResult.Subject))
-	}
-
-	resp, err := h.services.WebAuthn.FinishRegistration(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Error("Failed to finish WebAuthn registration", zap.Error(err))
-		switch {
-		case errors.Is(err, service.ErrChallengeNotFound):
-			c.JSON(404, gin.H{"error": "Challenge not found"})
-		case errors.Is(err, service.ErrChallengeExpired):
-			c.JSON(410, gin.H{"error": "Challenge expired"})
-		case errors.Is(err, service.ErrVerificationFailed):
-			c.JSON(400, gin.H{"error": "Verification failed"})
-		case errors.Is(err, service.ErrAAGUIDBlacklisted):
-			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
-		default:
-			c.JSON(500, gin.H{"error": "Failed to complete registration"})
-		}
-		return
-	}
-
-	// Set private data ETag header if available
-	if len(resp.PrivateData) > 0 {
-		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
-	}
-
-	c.JSON(200, resp)
-}
-
-// StartWebAuthnLogin begins the WebAuthn login process
-func (h *Handlers) StartWebAuthnLogin(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	resp, err := h.services.WebAuthn.BeginLogin(c.Request.Context())
-	if err != nil {
-		h.logger.Error("Failed to start WebAuthn login", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to start login"})
-		return
-	}
-
-	c.JSON(200, resp)
-}
-
-// FinishWebAuthnLogin completes the WebAuthn login process
-func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.FinishLoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Check if OIDC gate authentication result is present
-	// Note: For login, we can't get tenant ID from request - it's determined from the credential
-	// The middleware sets the result in context, and the service will verify it matches the user's bound identity
-	if oidcResult, exists := middleware.GetOIDCGateResultGin(c); exists {
-		// Extract email from claims if available
-		var email string
-		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-			email = emailClaim
-		}
-		req.OIDCGateBinding = &service.OIDCGateBinding{
-			Issuer:  oidcResult.Issuer,
-			Subject: oidcResult.Subject,
-			Email:   email,
-		}
-	}
-
-	resp, err := h.services.WebAuthn.FinishLogin(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Error("Failed to finish WebAuthn login", zap.Error(err))
-
-		switch {
-		case errors.Is(err, service.ErrChallengeNotFound):
-			c.JSON(404, gin.H{"error": "Challenge not found"})
-		case errors.Is(err, service.ErrChallengeExpired):
-			c.JSON(410, gin.H{"error": "Challenge expired"})
-		case errors.Is(err, service.ErrUserNotFound):
-			c.JSON(404, gin.H{"error": "User not found"})
-		case errors.Is(err, service.ErrCredentialNotFound):
-			c.JSON(404, gin.H{"error": "Credential not found"})
-		case errors.Is(err, service.ErrVerificationFailed):
-			c.JSON(401, gin.H{"error": "Authentication failed"})
-		case errors.Is(err, service.ErrTenantAccessDenied):
-			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
-		case errors.Is(err, service.ErrIdentityNotBound):
-			c.JSON(403, gin.H{"error": "No enterprise identity bound for this wallet"})
-		case errors.Is(err, service.ErrIdentityBindingMismatch):
-			c.JSON(403, gin.H{"error": "Enterprise identity does not match registered identity"})
-		case errors.Is(err, service.ErrOIDCGateRequired):
-			c.JSON(401, gin.H{
-				"error": "OIDC gate authentication required",
-				"code":  "oidc_gate_required",
-			})
-		default:
-			c.JSON(500, gin.H{"error": "Failed to complete login"})
-		}
-		return
-	}
-
-	// Set private data ETag header if available
-	if len(resp.PrivateData) > 0 {
-		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
-	}
-
-	c.JSON(200, resp)
-}
-
-// RefreshToken exchanges a valid refresh token for a new access token
-func (h *Handlers) RefreshToken(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.RefreshTokenRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	resp, err := h.services.WebAuthn.RefreshAccessToken(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Warn("Token refresh failed", zap.Error(err))
-		switch {
-		case errors.Is(err, service.ErrInvalidRefreshToken):
-			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
-		default:
-			c.JSON(500, gin.H{"error": "Failed to refresh token"})
-		}
-		return
-	}
-
-	c.JSON(200, resp)
-}
-
 // Storage handlers - Credentials
 
-// getHolderDID retrieves the holder DID from context
+// getHolderDID returns the holder DID for the caller, always derived from user_id via
+// domain.HolderDID. AS-issued tokens carry no "did" claim, and trusting one would give
+// a user two holder identities.
 func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
-	did, exists := c.Get("did")
-	if exists && did.(string) != "" {
-		return did.(string), true
+	userID, ok := contextUserID(c)
+	if !ok {
+		return "", false
 	}
-	// Fallback to user_id if did is not set
-	userID, exists := c.Get("user_id")
+	return domain.HolderDID(userID), true
+}
+
+// contextUserID returns the authenticated user ID set on the gin context by
+// the auth middleware. It reports false when the value is missing or is not a
+// string, so callers fail closed (401) rather than panicking on a bad
+// assertion.
+func contextUserID(c *gin.Context) (string, bool) {
+	v, exists := c.Get("user_id")
 	if !exists {
 		return "", false
 	}
-	return userID.(string), true
+	userID, ok := v.(string)
+	return userID, ok
 }
 
 // getTenantID retrieves the tenant ID from context.
 // For authenticated requests, this comes from the JWT token (security boundary).
 // For unauthenticated requests, this comes from X-Tenant-ID header.
-// Handles both string (from JWT via AuthMiddleware) and domain.TenantID types.
+// Handles both string (from the JWT via TokenAuthMiddleware) and domain.TenantID types.
 func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantID, exists := c.Get("tenant_id")
 	if !exists {
@@ -355,7 +123,7 @@ func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 		return domain.DefaultTenantID, true
 	}
 
-	// Handle string type (from JWT via AuthMiddleware)
+	// Handle string type (from the JWT via TokenAuthMiddleware)
 	if tidStr, ok := tenantID.(string); ok {
 		return domain.TenantID(tidStr), true
 	}
@@ -631,13 +399,35 @@ func (h *Handlers) GetCertificate(c *gin.Context) {
 	c.JSON(200, resp)
 }
 
+// SecurityPropertiesRequest carries WSCD security metadata from native SDKs.
+// These become top-level KA JWT claims per Annex C §C.3.1.
+type SecurityPropertiesRequest struct {
+	KeyStorage         []string    `json:"key_storage"`
+	UserAuthentication []string    `json:"user_authentication"`
+	Certification      interface{} `json:"certification,omitempty"`
+}
+
+func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
+	if s == nil {
+		return nil
+	}
+	return &service.SecurityProperties{
+		KeyStorage:         s.KeyStorage,
+		UserAuthentication: s.UserAuthentication,
+		Certification:      s.Certification,
+	}
+}
+
 // GenerateKeyAttestation generates a key attestation JWT
 func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 	var req struct {
 		JWKS       []map[string]interface{} `json:"jwks"`
 		OpenID4VCI struct {
-			Nonce string `json:"nonce"`
+			Nonce            string `json:"nonce"`
+			CredentialIssuer string `json:"credential_issuer,omitempty"`
 		} `json:"openid4vci"`
+		SecurityProperties *SecurityPropertiesRequest `json:"security_properties,omitempty"`
+		WalletInstanceID   string                     `json:"wallet_instance_id,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{
@@ -655,6 +445,32 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
+	if len(req.JWKS) > service.MaxJWKSPerRequest {
+		c.JSON(400, gin.H{
+			"error":   "INVALID_JWKS",
+			"message": fmt.Sprintf("too many JWKs: %d exceeds maximum of %d", len(req.JWKS), service.MaxJWKSPerRequest),
+		})
+		return
+	}
+
+	// Validate that each JWK entry is non-nil and contains required fields
+	for i, jwk := range req.JWKS {
+		if jwk == nil {
+			c.JSON(400, gin.H{
+				"error":   "INVALID_JWKS",
+				"message": fmt.Sprintf("jwks[%d] is null", i),
+			})
+			return
+		}
+		if _, ok := jwk["kty"]; !ok {
+			c.JSON(400, gin.H{
+				"error":   "INVALID_JWKS",
+				"message": fmt.Sprintf("jwks[%d] is missing 'kty' field", i),
+			})
+			return
+		}
+	}
+
 	if req.OpenID4VCI.Nonce == "" {
 		c.JSON(400, gin.H{
 			"error":   "INVALID_OPENID4VCI_NONCE_VALUE",
@@ -663,7 +479,14 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
-	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(c.Request.Context(), req.JWKS, req.OpenID4VCI.Nonce)
+	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(
+		c.Request.Context(),
+		req.JWKS,
+		req.OpenID4VCI.Nonce,
+		req.SecurityProperties.toService(),
+		req.WalletInstanceID,
+		req.OpenID4VCI.CredentialIssuer,
+	)
 	if err != nil {
 		h.logger.Error("Failed to generate key attestation", zap.Error(err))
 		c.JSON(400, gin.H{
@@ -680,13 +503,13 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 
 // GetPrivateData retrieves the user's private data
 func (h *Handlers) GetPrivateData(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	data, etag, err := h.services.User.GetPrivateData(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	data, etag, err := h.services.User.GetPrivateData(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "User not found"})
@@ -717,8 +540,8 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 
 // UpdatePrivateData updates the user's private data
 func (h *Handlers) UpdatePrivateData(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -743,7 +566,7 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 
 	newEtag, err := h.services.User.UpdatePrivateData(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		[]byte(privateData),
 		ifMatch,
 	)
@@ -766,42 +589,38 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	c.Status(204)
 }
 
-// Logout invalidates the current session by blacklisting the JWT
+// maxConfiguredASTokenTTL returns the longest lifetime the AS is configured
+// to issue an access token for, across DefaultTokenTTL and every
+// per-audience override in AudienceTTLs - used by Logout to size a
+// blacklist entry for an AS-issued token whose actual expiry isn't exposed
+// by go-tokenauth's validation result.
+func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
+	longest := cfg.AS.DefaultTokenTTL
+	for _, ttl := range cfg.AS.AudienceTTLs {
+		if ttl > longest {
+			longest = ttl
+		}
+	}
+	return longest
+}
+
+// Logout blacklists the jti of the access token TokenAuthMiddleware already validated.
 func (h *Handlers) Logout(c *gin.Context) {
-	// Get the token from context (set by auth middleware)
-	tokenString, exists := c.Get("token")
+	v, exists := c.Get("tokenauth_result")
 	if !exists {
-		// No token? Already logged out effectively
+		// No validated token in the context: nothing to revoke.
 		c.Status(200)
 		return
 	}
-
-	// Parse the token to get claims (we need jti and exp)
-	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
-		return []byte(h.cfg.JWT.Secret), nil
-	})
-
-	if token != nil && token.Claims != nil {
-		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			jti, _ := claims["jti"].(string)
-			if jti != "" && h.services.TokenBlacklist != nil {
-				// Get expiry time for blacklist entry
-				var expiry time.Time
-				if exp, ok := claims["exp"].(float64); ok {
-					expiry = time.Unix(int64(exp), 0)
-				} else {
-					// Default to 24 hours if no expiry (shouldn't happen)
-					expiry = time.Now().Add(24 * time.Hour)
-				}
-
-				// Add to blacklist
-				if err := h.services.TokenBlacklist.Add(c.Request.Context(), jti, expiry); err != nil {
-					h.logger.Warn("Failed to blacklist token", zap.Error(err))
-				} else {
-					h.logger.Info("User logged out, token blacklisted",
-						zap.String("jti", jti),
-					)
-				}
+	if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
+		if result.JTI != "" && h.services.TokenBlacklist != nil {
+			expiry := time.Now().Add(maxConfiguredASTokenTTL(h.cfg) + time.Minute)
+			if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
+				h.logger.Warn("Failed to blacklist token", zap.Error(err))
+			} else {
+				h.logger.Info("User logged out, token blacklisted",
+					zap.String("jti", result.JTI),
+				)
 			}
 		}
 	}
@@ -811,17 +630,21 @@ func (h *Handlers) Logout(c *gin.Context) {
 
 // DeleteUser deletes the current user and all associated data
 func (h *Handlers) DeleteUser(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	holderDID := userID.(string) // Using userID as holderDID
+	// Use the same canonical holder DID resolution as every other credential
+	// operation (see getHolderDID) - not the raw user_id - so this actually
+	// finds and deletes the credentials/presentations that were stored under
+	// it (#384).
+	holderDID, _ := h.getHolderDID(c)
 
 	if err := h.services.User.DeleteUser(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		holderDID,
 	); err != nil {
 		h.logger.Error("Failed to delete user", zap.Error(err))
@@ -837,7 +660,6 @@ type AccountInfoResponse struct {
 	UUID                string                   `json:"uuid"`
 	Username            *string                  `json:"username,omitempty"`
 	DisplayName         *string                  `json:"displayName,omitempty"`
-	HasPassword         bool                     `json:"hasPassword"`
 	Settings            AccountSettings          `json:"settings"`
 	WebauthnCredentials []WebauthnCredentialInfo `json:"webauthnCredentials"`
 }
@@ -857,13 +679,13 @@ type WebauthnCredentialInfo struct {
 
 // GetAccountInfo returns account information for the current user
 func (h *Handlers) GetAccountInfo(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
@@ -891,7 +713,6 @@ func (h *Handlers) GetAccountInfo(c *gin.Context) {
 		UUID:        user.UUID.String(),
 		Username:    user.Username,
 		DisplayName: user.DisplayName,
-		HasPassword: user.PasswordHash != nil,
 		Settings: AccountSettings{
 			OpenIDRefreshTokenMaxAgeInSeconds: user.OpenIDRefreshTokenMaxAge,
 		},
@@ -908,8 +729,8 @@ type UpdateSettingsRequest struct {
 
 // UpdateSettings updates user settings
 func (h *Handlers) UpdateSettings(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -922,7 +743,7 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 
 	user, err := h.services.User.UpdateSettings(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		req.OpenIDRefreshTokenMaxAgeInSeconds,
 	)
 	if err != nil {
@@ -949,13 +770,13 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	resp, err := h.services.WebAuthn.BeginAddCredential(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	resp, err := h.services.WebAuthn.BeginAddCredential(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
@@ -976,8 +797,8 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -993,7 +814,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 
 	resp, err := h.services.WebAuthn.FinishAddCredential(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		&req,
 		ifMatch,
 	)
@@ -1010,7 +831,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		case errors.Is(err, service.ErrPrivateDataConflict):
 			// Get current ETag
-			user, _ := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+			user, _ := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
 			if user != nil {
 				c.Header("X-Private-Data-ETag", user.PrivateDataETag)
 			}
@@ -1036,8 +857,8 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1068,7 +889,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 
 	newEtag, err := h.services.User.DeleteWebAuthnCredential(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		credentialID,
 		privateData,
 		ifMatch,
@@ -1104,8 +925,8 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1120,7 +941,7 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 
 	if err := h.services.User.RenameWebAuthnCredential(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		credentialID,
 		req.Nickname,
 	); err != nil {
@@ -1149,13 +970,13 @@ func (h *Handlers) WebSocketKeystore(c *gin.Context) {
 
 // KeystoreStatus checks if a user's keystore client is connected
 func (h *Handlers) KeystoreStatus(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	connected := h.services.Keystore.IsClientConnected(userID.(string))
+	connected := h.services.Keystore.IsClientConnected(userID)
 	c.JSON(200, gin.H{
 		"connected": connected,
 	})

@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,13 +18,17 @@ import (
 	"github.com/gin-gonic/gin"
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"github.com/sirosfoundation/go-trust/pkg/authzenclient"
+	"github.com/sirosfoundation/go-trust/pkg/registry/didutil"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuertrust"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
-	"go.uber.org/zap"
 )
 
 // IssuerMetadataResolver resolves OpenID4VCI issuer metadata from a credential issuer URL.
@@ -58,6 +63,12 @@ type RegisteredIssuerInfo struct {
 type resolveURLResponse struct {
 	gotrust.EvaluationResponse
 	RegisteredIssuer *RegisteredIssuerInfo `json:"registered_issuer,omitempty"`
+	// IssuerEntitlement reports whether the provider is registered to issue
+	// what it is offering, per ARF §6.6.2.3. Absent when the check was not
+	// applicable. Note it is reported separately from Decision: the PDP answers
+	// "is this issuer trusted", this answers "is it entitled to issue this",
+	// and collapsing them would lose which one failed.
+	IssuerEntitlement *issuertrust.Decision `json:"issuer_entitlement,omitempty"`
 }
 
 // AuthZENProxyHandler handles AuthZEN evaluation requests by proxying to a PDP.
@@ -170,7 +181,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 	)
 	// Propagate the HTTP client's allow_http setting so that logo and
 	// jwks_uri fetches respect the same policy as metadata resolution.
-	handler.allowHTTP = cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify
+	handler.allowHTTP = cfg.HTTPClient.AllowsPlaintext()
 
 	logger.Info("AuthZEN proxy initialized",
 		zap.String("pdp_url", pdpURL),
@@ -218,7 +229,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(h.cfg.Timeout)*time.Second)
 	defer cancel()
 
-	// Get tenant from context (set by AuthMiddleware from JWT)
+	// Get tenant from context (set by TokenAuthMiddleware from the token)
 	// Use safe type assertion to avoid panic from misconfigured middleware
 	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {
@@ -233,9 +244,15 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 		return
 	}
 
-	// Get user ID for audit logging
-	userIDVal, _ := c.Get("user_id")
-	userID := fmt.Sprintf("%v", userIDVal)
+	// Get user ID for audit logging. Not set at all for anonymous requests
+	// (see TokenAuthMiddleware) - "" (rather than the fmt.Sprintf("<nil>")
+	// a bare type assertion on the missing key would otherwise produce)
+	// keeps this readable in logs and matches the pre-existing convention
+	// used elsewhere in this codebase for "no identity" callers.
+	var userID string
+	if v, exists := c.Get("user_id"); exists {
+		userID = fmt.Sprintf("%v", v)
+	}
 
 	// Parse the evaluation request
 	var req gotrust.EvaluationRequest
@@ -355,9 +372,10 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 
 	// Parse the resolve request
 	var req struct {
-		SubjectID    string `json:"subject_id" binding:"required"`
-		SubjectType  string `json:"subject_type"`  // "key" (default) or "url"
-		ResourceType string `json:"resource_type"` // e.g. "credential_issuer" (default for url subjects)
+		SubjectID       string   `json:"subject_id" binding:"required"`
+		SubjectType     string   `json:"subject_type"`     // "key" (default) or "url"
+		ResourceType    string   `json:"resource_type"`    // e.g. "credential_issuer" (default for url subjects)
+		CredentialTypes []string `json:"credential_types"` // optional credential type filter (e.g. VCT values)
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -374,11 +392,23 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// When subject_type is "url", validate that subject_id is a well-formed HTTPS URL.
+	// When subject_type is "url", validate that subject_id is a well-formed
+	// HTTPS URL. Plain HTTP is permitted when allowHTTP is set (test/dev
+	// environments) - same escape hatch every other scheme check in this
+	// file already honors (jwks_uri, logo URLs, proxy dispatch); this one
+	// was missed, so an http:// issuer (e.g. docker-compose's
+	// http://vc-apigw:8080) always 400ed here before reaching any of those.
 	if subjectType == "url" {
 		u, err := url.Parse(req.SubjectID)
-		if err != nil || u.Scheme != "https" || u.Host == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "subject_id must be a valid HTTPS URL when subject_type is 'url'"})
+		if err != nil || u.Host == "" || (u.Scheme != "https" && (!h.allowHTTP || u.Scheme != "http")) {
+			// Message tracks the scheme actually accepted, so an operator
+			// running with allow_http isn't told to use HTTPS for a URL that
+			// would have been fine over HTTP.
+			msg := "subject_id must be a valid HTTPS URL when subject_type is 'url'"
+			if h.allowHTTP {
+				msg = "subject_id must be a valid HTTPS or HTTP URL (allow_http is enabled) when subject_type is 'url'"
+			}
+			c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 			return
 		}
 	}
@@ -405,6 +435,17 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		},
 	}
 
+	// Attach credential_types as action.parameters so they reach the PDP
+	// on all code paths (proxy fallback, key subjects, URL resolution).
+	if len(req.CredentialTypes) > 0 {
+		evalReq.Action = &gotrust.Action{
+			Name: resourceType,
+			Parameters: map[string]interface{}{
+				"credential_types": req.CredentialTypes,
+			},
+		}
+	}
+
 	// Authorize the query
 	authzReq := &authz.AuthorizationRequest{
 		TenantID: tenantID,
@@ -415,10 +456,31 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		return
 	}
 
-	// For URL subjects, resolve locally via the metadata resolver when available.
-	// Fall back to proxying to the PDP when no resolver is configured so that
-	// deployments without AllowResolution retain backward-compatible behaviour.
+	// For URL subjects, dispatch based on resource type
 	if subjectType == "url" {
+		if resourceType == "credential_offer_uri" {
+			h.resolveCredentialOfferURI(c, ctx, req.SubjectID)
+			return
+		}
+		// Allowlist: only credential_issuer and oauth-authorization-server are
+		// valid beyond this point. An unknown resource_type would silently
+		// fall through to credential-issuer resolution, creating a
+		// policy-bypass surface if SPOCP rules are permissive.
+		//
+		// oauth-authorization-server was added below (the switch case calling
+		// resolveAuthorizationServerMetadata) without updating this allowlist,
+		// making that case dead code - every oauth-authorization-server
+		// request 400ed here first. Confirmed live: OpenID4VCIHelper's
+		// getAuthorizationServerMetadata (used to decide whether to PAR a
+		// credential-issuance flow) always got this 400, so
+		// pushed_authorization_request_endpoint was never seen even when the
+		// issuer's real discovery document advertised one and required PAR -
+		// the wallet fell back to an un-PARed authorize redirect instead.
+		if resourceType != "credential_issuer" && resourceType != "oauth-authorization-server" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported resource_type for URL subjects: %s", resourceType)})
+			return
+		}
+		// Resolve as credential issuer (fetches /.well-known/openid-credential-issuer)
 		if h.metadataResolver == nil {
 			h.logger.Debug("no metadata resolver configured for URL subject — proxying to PDP")
 			h.proxyToPDP(c, ctx, tenantID, evalReq)
@@ -428,13 +490,137 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 		case "oauth-authorization-server":
 			h.resolveAuthorizationServerMetadata(c, ctx, tenantID, req.SubjectID)
 		default:
-			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID)
+			h.resolveURLSubject(c, ctx, tenantID, req.SubjectID, req.CredentialTypes)
 		}
+		return
+	}
+
+	// For key subjects with resource_type=credential_issuer
+	if subjectType == "key" && resourceType == "credential_issuer" && strings.HasPrefix(req.SubjectID, "did:web:") {
+		parsed, err := didutil.Parse(req.SubjectID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		issuerURL, err := parsed.ToBaseURL("https")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		// Reuse existing URL subject resolution (fetches metadata, evaluates trust)
+		h.resolveURLSubject(c, ctx, tenantID, issuerURL, req.CredentialTypes)
 		return
 	}
 
 	// For key subjects, proxy to PDP
 	h.proxyToPDP(c, ctx, tenantID, evalReq)
+}
+
+// resolveCredentialOfferURI fetches a credential_offer_uri and returns the parsed
+// credential offer document. The offer URI is fetched server-side using the
+// configured httpClient, which applies SSRF protections via transport-level
+// restrictions. The URL must already be validated as HTTPS before this call.
+//
+// Response: { "decision": true, "context": { "credential_offer": <offer doc> } }
+func (h *AuthZENProxyHandler) resolveCredentialOfferURI(c *gin.Context, ctx context.Context, offerURI string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, offerURI, nil)
+	if err != nil {
+		h.logger.Error("failed to build credential offer request",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch credential offer"})
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+
+	// Shallow-copy the client to set a per-request CheckRedirect without
+	// affecting concurrent callers; Transport is shared and safe.
+	client := *h.httpClient
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" && (!h.allowHTTP || req.URL.Scheme != "http") {
+			return fmt.Errorf("refusing redirect to non-HTTPS URL: %s", req.URL)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		h.logger.Error("credential offer fetch failed",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch credential offer"})
+		return
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Warn("credential offer endpoint returned non-200",
+			zap.String("offer_uri", offerURI),
+			zap.Int("status", resp.StatusCode),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("credential offer endpoint returned status %d", resp.StatusCode)})
+		return
+	}
+
+	// Read one extra byte to detect truncation: if the body exceeds the cap,
+	// reject it rather than silently accepting a partial document.
+	const maxOfferSize = 1 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxOfferSize+1))
+	if err != nil {
+		h.logger.Error("failed to read credential offer response",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read credential offer response"})
+		return
+	}
+
+	if len(body) > maxOfferSize {
+		h.logger.Warn("credential offer response exceeds size limit",
+			zap.String("offer_uri", offerURI),
+			zap.Int("limit", maxOfferSize),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("credential offer response exceeds %d byte limit", maxOfferSize)})
+		return
+	}
+
+	var offer map[string]interface{}
+	if err := json.Unmarshal(body, &offer); err != nil {
+		h.logger.Warn("credential offer response is not valid JSON",
+			zap.String("offer_uri", offerURI),
+			zap.Error(err),
+		)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer response is not valid JSON"})
+		return
+	}
+
+	// Validate the document contains the required OID4VCI credential offer fields.
+	credentialIssuer, ok := offer["credential_issuer"].(string)
+	if !ok {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer missing required field: credential_issuer"})
+		return
+	}
+	if _, ok := offer["credential_configuration_ids"].([]interface{}); !ok {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer missing required field: credential_configuration_ids"})
+		return
+	}
+
+	h.logger.Info("credential offer URI resolved",
+		zap.String("offer_uri", offerURI),
+		zap.String("credential_issuer", credentialIssuer),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"decision": true,
+		"context": gin.H{
+			"credential_offer": offer,
+		},
+	})
 }
 
 // resolveURLSubject handles the local resolution path for URL subjects.
@@ -444,7 +630,7 @@ func (h *AuthZENProxyHandler) Resolve(c *gin.Context) {
 //   - metadata is signed AND the PDP returns trusted
 //
 // If metadata is signed but untrusted, an error is returned.
-func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Context, tenantID, issuerURL string) {
+func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Context, tenantID, issuerURL string, credentialTypes []string) {
 	// Step 1: Resolve issuer metadata locally
 	result, err := h.metadataResolver.ResolveWithInfo(ctx, issuerURL)
 	if err != nil {
@@ -503,6 +689,13 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// Build trust evaluation request with key material.
 	// Action is set to "credential-issuer" so PDP policy can distinguish
 	// issuer trust evaluation from verifier or general resolution requests.
+	action := &gotrust.Action{Name: "credential-issuer"}
+	if len(credentialTypes) > 0 {
+		action.Parameters = map[string]interface{}{
+			"credential_types": credentialTypes,
+		}
+	}
+
 	trustReq := &gotrust.EvaluationRequest{
 		Subject: gotrust.Subject{
 			Type: "key",
@@ -511,7 +704,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		Resource: gotrust.Resource{
 			ID: issuerURL,
 		},
-		Action: &gotrust.Action{Name: "credential-issuer"},
+		Action: action,
 	}
 
 	if keyMaterial != nil {
@@ -561,8 +754,29 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if !metadataIsSigned || trustResp.Decision {
 		h.inlineLogos(ctx, result.Metadata)
 	}
+	// A valid org.siros.secret_seed advertisement (names only) stays; a
+	// malformed one makes the configuration "not offered" (5A.3). This runs
+	// after key extraction and the trust decision above, so dropping the
+	// original signed_metadata JWT here cannot change that decision.
+	sanitizeSecretSeedAdvertisement(result.Metadata)
 
-	// Step 6: Return composite response with trust decision and metadata
+	// Step 6: Evaluate whether this provider is entitled to issue what it is
+	// offering. Distinct from the PDP decision above, which answers whether the
+	// issuer is trusted at all — a trusted issuer can still be unregistered for
+	// the credential type it is proposing.
+	entitlement := h.evaluateIssuerEntitlement(result, keyMaterial, credentialTypes)
+	if entitlement != nil && !entitlement.Allowed {
+		h.logger.Warn("issuer is not entitled to issue the requested credential",
+			zap.String("issuer_url", issuerURL),
+			zap.Any("findings", entitlement.Findings))
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":              "issuer is not registered to issue the requested credential",
+			"issuer_entitlement": entitlement,
+		})
+		return
+	}
+
+	// Step 7: Return composite response with trust decision and metadata
 	resp := &resolveURLResponse{
 		EvaluationResponse: gotrust.EvaluationResponse{
 			Decision: trustResp.Decision,
@@ -574,8 +788,9 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if trustResp.Context != nil && trustResp.Context.Reason != nil {
 		resp.Context.Reason = trustResp.Context.Reason
 	}
+	resp.IssuerEntitlement = entitlement
 
-	// Step 7: Enrich response with registered issuer info from backend storage.
+	// Step 8: Enrich response with registered issuer info from backend storage.
 	// Scoped strictly to the authenticated tenant — tenantID is enforced non-empty
 	// by Resolve() before this function is called, preventing cross-tenant access.
 	// If the issuer is not registered in this tenant's storage, the field is omitted.
@@ -769,6 +984,51 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 	return nil, false
 }
 
+// sanitizeSecretSeedAdvertisement enforces privatedata-spec 5A.3/5A.4 on the
+// issuer metadata served to the wallet, in place. A valid advertisement
+// ({"org.siros.secret_seed":{"namespaces":[...]}}, names only) is public and is
+// served unchanged, because the wallet needs it to request response encryption.
+// A credential configuration whose org.siros.secret_seed member is malformed
+// (carrying hex or any other non-list content) is treated as not offered: the
+// whole configuration is removed, so no such value reaches the wallet.
+//
+// When a configuration is removed, the original signed_metadata JWT (kept by
+// the resolver for legacy signed metadata) is also dropped from the served
+// document: its base64url payload still carries the rejected configuration,
+// and editing the payload would invalidate the signature. The wallet then
+// receives the sanitized claims without that JWT. The signature was verified
+// and the trust decision taken before this runs; the effect is only that the
+// wallet cannot re-verify the (by now modified) document itself.
+func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
+	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for id, ccRaw := range ccs {
+		cc, ok := ccRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cm, ok := cc["credential_metadata"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, has := cm["org.siros.secret_seed"]; !has {
+			continue
+		}
+		raw, err := json.Marshal(cm)
+		if err != nil {
+			delete(ccs, id)
+			delete(metadata, "signed_metadata")
+			continue
+		}
+		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
+			delete(ccs, id)
+			delete(metadata, "signed_metadata")
+		}
+	}
+}
+
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.
 // It modifies the metadata in place. Only HTTPS URLs are fetched; data: URIs
 // are left unchanged.
@@ -938,6 +1198,113 @@ func (h *AuthZENProxyHandler) getPDPURL(ctx context.Context, tenantID string) (s
 func getActionName(req *gotrust.EvaluationRequest) string {
 	if req.Action != nil {
 		return req.Action.Name
+	}
+	return ""
+}
+
+// evaluateIssuerEntitlement applies the ARF §6.6.2.3 wallet-side checks to a
+// resolved provider: is the signing certificate a WRPAC, does the registration
+// certificate describe this provider, and is it registered for what it offers.
+//
+// Returns nil when there is nothing to say — mode off, or metadata that was
+// never signed, in which case the trust decision above has already dealt with it.
+func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
+	result *issuermetadata.ResolveResult,
+	keyMaterial *trust.KeyMaterial,
+	credentialTypes []string,
+) *issuertrust.Decision {
+	mode := issuertrust.ParseMode(h.cfg.IssuerEntitlementMode)
+	if mode == issuertrust.ModeOff || result == nil {
+		return nil
+	}
+
+	chain := parseX5CChain(keyMaterial)
+	if len(chain) == 0 && !result.Signed {
+		// Unsigned metadata is not an entitlement problem, and reporting it as
+		// one would double up on a decision already made above.
+		return nil
+	}
+
+	return issuertrust.Evaluate(issuertrust.Input{
+		Chain:            chain,
+		RegistrationCert: issuermetadata.RegistrationCertificate(result.Metadata),
+		Offers:           offersFor(result.Metadata, credentialTypes),
+	}, mode)
+}
+
+// parseX5CChain decodes the base64 DER certificates the resolver extracted.
+// Certificates that do not parse are skipped rather than failing the request:
+// the leaf is what the checks need, and the resolver has already verified the
+// signature made with it.
+func parseX5CChain(km *trust.KeyMaterial) []*x509.Certificate {
+	if km == nil || km.Type != "x5c" {
+		return nil
+	}
+	out := make([]*x509.Certificate, 0, len(km.X5C))
+	for _, encoded := range km.X5C {
+		der, err := decodeX5C(encoded)
+		if err != nil {
+			continue
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			continue
+		}
+		out = append(out, cert)
+	}
+	return out
+}
+
+// decodeX5C accepts both base64 alphabets, matching what the signature
+// verification path already tolerates.
+//
+// RFC 7515 specifies standard base64 for x5c, but
+// trust.VerifyJWTWithEmbeddedKey falls back to raw URL encoding, so a chain it
+// accepted could be dropped here - and a dropped chain does not surface as a
+// decoding problem, it surfaces as "no_access_certificate", which reads as an
+// issuer that published nothing rather than one this code failed to read.
+func decodeX5C(encoded string) ([]byte, error) {
+	if der, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+		return der, nil
+	}
+	return base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
+}
+
+// offersFor turns the credential configurations the wallet is about to request
+// into the (format, type) pairs provides_attestations is expressed in.
+//
+// credentialTypes names configuration ids from the offer; the metadata says
+// what format and vct or doctype each one actually is. Guessing the format
+// would make the check meaningless, so a configuration that cannot be resolved
+// is skipped and simply not checked.
+func offersFor(metadata map[string]interface{}, credentialTypes []string) []issuertrust.Offer {
+	configs, _ := metadata["credential_configurations_supported"].(map[string]interface{})
+	if configs == nil {
+		return nil
+	}
+	var offers []issuertrust.Offer
+	for _, id := range credentialTypes {
+		cfg, ok := configs[id].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		format, _ := cfg["format"].(string)
+		if format == "" {
+			continue
+		}
+		offers = append(offers, issuertrust.Offer{Format: format, Type: credentialTypeOf(cfg)})
+	}
+	return offers
+}
+
+// credentialTypeOf reads the type a configuration declares: vct for SD-JWT,
+// doctype for mdoc. An empty result means only the format is matched.
+func credentialTypeOf(cfg map[string]interface{}) string {
+	if vct, ok := cfg["vct"].(string); ok && vct != "" {
+		return vct
+	}
+	if doctype, ok := cfg["doctype"].(string); ok && doctype != "" {
+		return doctype
 	}
 	return ""
 }

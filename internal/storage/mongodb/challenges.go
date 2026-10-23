@@ -30,7 +30,7 @@ func (s *ChallengeStore) Create(ctx context.Context, challenge *domain.WebauthnC
 
 func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
 	var challenge domain.WebauthnChallenge
-	err := s.collection.FindOne(ctx, bson.M{"_id": id}).Decode(&challenge)
+	err := s.collection.FindOne(ctx, idFilter(id)).Decode(&challenge)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -40,8 +40,49 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 	return &challenge, nil
 }
 
+func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	err := s.collection.FindOneAndDelete(ctx, idFilter(id)).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	filter := bson.D{{Key: "_id", Value: id}, {Key: "user_id", Value: userID}}
+	err := s.collection.FindOneAndDelete(ctx, filter).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	var challenge domain.WebauthnChallenge
+	filter := bson.D{{Key: "_id", Value: id}}
+	if expectedTenantID != "" {
+		filter = append(filter, bson.E{Key: "tenant_id", Value: expectedTenantID})
+	}
+	err := s.collection.FindOneAndDelete(ctx, filter).Decode(&challenge)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
+	}
+	return &challenge, nil
+}
+
 func (s *ChallengeStore) Delete(ctx context.Context, id string) error {
-	_, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+	_, err := s.collection.DeleteOne(ctx, idFilter(id))
 	if err != nil {
 		return fmt.Errorf("failed to delete challenge: %w", err)
 	}
@@ -59,7 +100,7 @@ func (s *ChallengeStore) DeleteExpired(ctx context.Context) error {
 }
 
 func (s *ChallengeStore) DeleteByUserID(ctx context.Context, userID string) error {
-	_, err := s.collection.DeleteMany(ctx, bson.M{"user_id": userID})
+	_, err := s.collection.DeleteMany(ctx, fieldFilter("user_id", userID))
 	if err != nil {
 		return fmt.Errorf("failed to delete challenges for user: %w", err)
 	}
@@ -73,28 +114,7 @@ type IssuerStore struct {
 }
 
 func (s *IssuerStore) getNextID(ctx context.Context) (int64, error) {
-	result := s.counter.FindOneAndUpdate(
-		ctx,
-		bson.M{"_id": "issuer_id"},
-		bson.M{"$inc": bson.M{"value": 1}},
-		nil,
-	)
-
-	var doc struct {
-		Value int64 `bson:"value"`
-	}
-
-	if err := result.Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			_, err := s.counter.InsertOne(ctx, bson.M{"_id": "issuer_id", "value": int64(1)})
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return doc.Value, nil
+	return nextSequence(ctx, s.counter, "issuer_id")
 }
 
 func (s *IssuerStore) Create(ctx context.Context, issuer *domain.CredentialIssuer) error {
@@ -182,28 +202,7 @@ type VerifierStore struct {
 }
 
 func (s *VerifierStore) getNextID(ctx context.Context) (int64, error) {
-	result := s.counter.FindOneAndUpdate(
-		ctx,
-		bson.M{"_id": "verifier_id"},
-		bson.M{"$inc": bson.M{"value": 1}},
-		nil,
-	)
-
-	var doc struct {
-		Value int64 `bson:"value"`
-	}
-
-	if err := result.Decode(&doc); err != nil {
-		if err == mongo.ErrNoDocuments {
-			_, err := s.counter.InsertOne(ctx, bson.M{"_id": "verifier_id", "value": int64(1)})
-			if err != nil {
-				return 0, err
-			}
-			return 1, nil
-		}
-		return 0, err
-	}
-	return doc.Value, nil
+	return nextSequence(ctx, s.counter, "verifier_id")
 }
 
 func (s *VerifierStore) Create(ctx context.Context, verifier *domain.Verifier) error {

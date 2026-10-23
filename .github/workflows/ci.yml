@@ -7,16 +7,27 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    # MongoDB-backed tests (internal/storage/mongodb, internal/as session
+    # store, WIA challenge store) skip themselves unless TEST_MONGODB is set;
+    # run them here so they count for coverage and catch regressions.
+    services:
+      mongodb:
+        image: mongo:7
+        ports: ["27017:27017"]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -24,10 +35,12 @@ jobs:
         run: go mod download
 
       - name: Run tests
+        env:
+          TEST_MONGODB: "1"
         run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.txt
@@ -37,31 +50,84 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.10.0
+          version: v2.14.0
+          # Build golangci-lint with the runner's Go (setup-go resolves the
+          # latest 1.27.x). The prebuilt binary is built with an older Go and
+          # fails to read newer stdlib export data ("typecheck" errors).
+          install-mode: goinstall
           args: --timeout=5m --tests=false
           verify: false
+
+  config-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check docs/CONFIGURATION.md is up to date
+        run: |
+          make gen-config-docs
+          if [ -n "$(git status --porcelain -- docs/CONFIGURATION.md)" ]; then
+            git diff -- docs/CONFIGURATION.md || true
+            echo "::error::docs/CONFIGURATION.md is out of date. Run 'make gen-config-docs' and commit the result."
+            exit 1
+          fi
 
   build:
     runs-on: ubuntu-latest
     needs: [test, lint]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       - name: Build
         run: go build -v ./...
+
+  build-variants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Vet without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Vet with pkcs11 tag
+        # Non-blocking until PR #429 (fixes untagged stub tests in
+        # pkg/signing) merges; then remove continue-on-error.
+        continue-on-error: true
+        env:
+          CGO_ENABLED: "1"
+        run: go vet -tags pkcs11 ./...

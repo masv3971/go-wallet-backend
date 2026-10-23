@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	ts11client "github.com/sirosfoundation/go-ts11client"
 	"go.uber.org/zap"
 )
 
@@ -299,7 +300,7 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 		defer cancel()
 	}
 
-	fetchURL := source.resolveURL()
+	fetchURL := resolveSourceURL(&source)
 	f.logger.Info("fetching registry source", zap.String("url", fetchURL), zap.String("mode", string(source.Mode)))
 
 	body, err := f.fetchRaw(ctx, fetchURL)
@@ -335,10 +336,10 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 	return f.processLegacyResponse(ctx, source, body)
 }
 
-// resolveURL determines the actual fetch URL based on the Mode setting.
+// resolveSourceURL determines the actual fetch URL based on the Mode setting.
 // If the URL already points to a specific JSON file, it is used as-is.
 // Otherwise, the appropriate endpoint path is appended based on Mode.
-func (s *RemoteSourceConfig) resolveURL() string {
+func resolveSourceURL(s *RemoteSourceConfig) string {
 	u := s.URL
 	// If the URL already ends with a known endpoint file, use it directly.
 	if strings.HasSuffix(u, ".json") {
@@ -354,131 +355,114 @@ func (s *RemoteSourceConfig) resolveURL() string {
 	}
 }
 
-// processTS11Response processes a TS11-format /api/v1/schemas.json response,
-// including following pagination via offset/limit or legacy "next" field.
+// processTS11Response processes a TS11-format /api/v1/schemas.json
+// response. body is the page fetchFromSource already fetched for format
+// auto-detection; FetchTS11SchemasFromFirstPage reuses it instead of
+// fetching page 1 again, and owns the actual pagination-following and
+// per-schema-document fetch mechanics for any subsequent pages (offset/
+// limit or legacy "next" field) - this keeps exactly one implementation
+// of that logic instead of two.
 func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceConfig, body []byte) (map[string]*VCTMEntry, error) {
 	entries := make(map[string]*VCTMEntry)
-	var fetchedCount, filteredCount, errorCount int
+	var fetchedCount, filteredCount int
 
-	// Use the resolved endpoint URL for pagination (not the raw base URL)
-	resolvedURL := source.resolveURL()
-	currentBody := body
-	for {
-		var page TS11SchemasResponse
-		if err := json.Unmarshal(currentBody, &page); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal TS11 schemas response: %w", err)
+	resolvedURL := resolveSourceURL(&source)
+	docs, skipped, err := ts11client.FetchTS11SchemasFromFirstPage(ctx, f.client, resolvedURL, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch TS11 schemas: %w", err)
+	}
+
+	for _, s := range skipped {
+		switch s.Reason {
+		case ts11client.SkipReasonNoSchemaURIs:
+			f.logger.Warn("TS11 schema has no schemaURIs, skipping", zap.String("id", s.SchemaID))
+		default:
+			f.logger.Warn("failed to fetch schema document",
+				zap.String("schema_id", s.SchemaID),
+				zap.String("format", s.FormatIdentifier),
+				zap.String("url", s.URI),
+				zap.Error(s.Err))
+		}
+	}
+
+	// Each TS11Document is one format's document for a schema. A schema
+	// may offer both an sd-jwt (VCTM) and an mso_mdoc (MDDL) document for
+	// the same logical credential; each is cached under its own
+	// identifier ("vct" or "doctype") so both are queryable.
+	for _, doc := range docs {
+		// NOTE: we do not pre-derive the identifier from the schemaURI.
+		// The authoritative identifier lives inside the fetched document
+		// itself ("vct" for sd-jwt, "doctype" for mso_mdoc) and may not
+		// match the HTTP URL used to fetch it (e.g. a "vct" that's a URN
+		// like "urn:eudi:diploma:1"). We must apply the filter on the
+		// real value, extracted from the document, not the URL.
+		header := parseDocumentHeader(doc.Data)
+		id := header.identifier()
+		if id == "" {
+			id = doc.URI
 		}
 
-		for _, schema := range page.Entries() {
-			// Determine which schemaURI to use as the VCTM fetch URL.
-			// Prefer the dc+sd-jwt entry; fall back to the first URI.
-			var vctmURI string
-			for _, su := range schema.SchemaURIs {
-				if su.FormatIdentifier == "dc+sd-jwt" {
-					vctmURI = su.URI
-					break
-				}
-			}
-			if vctmURI == "" && len(schema.SchemaURIs) > 0 {
-				vctmURI = schema.SchemaURIs[0].URI
-			}
-			if vctmURI == "" {
-				f.logger.Warn("TS11 schema has no schemaURIs, skipping", zap.String("id", schema.ID))
-				errorCount++
-				continue
-			}
-
-			// NOTE: we do not pre-derive the VCT from the schemaURI.
-			// The authoritative VCT identifier lives inside the fetched VCTM
-			// document itself ("vct" field) and may be a URN (e.g.
-			// "urn:eudi:diploma:1") rather than the HTTP URL of the document.
-			// We must fetch first, then apply the filter on the real VCT.
-			entry, err := f.fetchTS11VCTM(ctx, schema, vctmURI)
-			if err != nil {
-				errorCount++
-				f.logger.Warn("failed to fetch TS11 VCTM",
-					zap.String("schema_id", schema.ID),
-					zap.String("url", vctmURI),
-					zap.Error(err))
-				continue
-			}
-
-			if !f.config.Filter.Matches(entry.VCT) {
-				filteredCount++
-				f.logger.Debug("filtered out credential", zap.String("vct", entry.VCT))
-				continue
-			}
-
-			entries[entry.VCT] = entry
-			fetchedCount++
+		if !f.config.Filter.Matches(id) {
+			filteredCount++
+			f.logger.Debug("filtered out credential", zap.String("id", id))
+			continue
 		}
 
-		// Follow pagination if more pages are available.
-		if !page.HasMorePages() {
-			break
+		entries[id] = &VCTMEntry{
+			VCT:              id,
+			Name:             header.displayName(),
+			Description:      header.displayDescription(),
+			Metadata:         json.RawMessage(doc.Data),
+			AttestationLoS:   doc.Schema.AttestationLoS,
+			BindingType:      doc.Schema.BindingType,
+			RulebookURI:      doc.Schema.RulebookURI,
+			SupportedFormats: doc.Schema.SupportedFormats,
+			FetchedAt:        time.Now(),
 		}
-		nextURL := page.NextPageURL(resolvedURL)
-		nextBody, err := f.fetchRaw(ctx, nextURL)
-		if err != nil {
-			f.logger.Warn("failed to fetch next page of schemas",
-				zap.String("url", nextURL),
-				zap.Error(err))
-			break
-		}
-		currentBody = nextBody
+		fetchedCount++
 	}
 
 	f.logger.Info("TS11 fetch complete",
 		zap.String("url", source.URL),
 		zap.Int("fetched", fetchedCount),
 		zap.Int("filtered", filteredCount),
-		zap.Int("errors", errorCount))
+		zap.Int("errors", len(skipped)))
 
 	return entries, nil
 }
 
-// fetchTS11VCTM fetches the VCTM document for a TS11 schema and constructs a VCTMEntry.
-// The authoritative VCT identifier, name, and description are all extracted from the
-// fetched VCTM document.  The VCT field in the document takes precedence over the
-// schemaURI used to fetch it, because the VCT may be a URN (e.g. "urn:eudi:diploma:1")
-// rather than an HTTP URL.  If the document does not contain a "vct" field, vctmURI is
-// used as the fallback identifier.
-func (f *Fetcher) fetchTS11VCTM(ctx context.Context, schema TS11SchemaMeta, vctmURI string) (*VCTMEntry, error) {
-	f.logger.Debug("fetching TS11 VCTM", zap.String("url", vctmURI))
+// fetchSchemaDocument fetches a single format's document for a TS11 schema
+// (a VCTM for sd-jwt, or an MDDL for mso_mdoc) and constructs a VCTMEntry.
+// The authoritative identifier, name, and description are all extracted from
+// the fetched document itself, taking precedence over docURI: the identifier
+// may be a URN (e.g. "urn:eudi:diploma:1") or a doctype (e.g.
+// "org.iso.18013.5.1.mDL") rather than the HTTP URL used to fetch it. If the
+// document contains neither a "vct" nor a "doctype" field, docURI is used as
+// the fallback identifier.
+func (f *Fetcher) fetchSchemaDocument(ctx context.Context, schema TS11SchemaMeta, docURI string) (*VCTMEntry, error) {
+	f.logger.Debug("fetching schema document", zap.String("url", docURI))
 
-	body, err := f.fetchRaw(ctx, vctmURI)
+	body, err := f.fetchRaw(ctx, docURI)
 	if err != nil {
 		return nil, err
 	}
 
 	if !json.Valid(body) {
-		return nil, fmt.Errorf("invalid JSON in VCTM response")
+		return nil, fmt.Errorf("invalid JSON in schema document response")
 	}
 
-	// Extract the authoritative VCT identifier, name, and description from the
-	// VCTM document itself.
-	var vctmDoc struct {
-		VCT         string `json:"vct"`
-		Name        string `json:"name"`
-		Description string `json:"description,omitempty"`
-	}
-	if err := json.Unmarshal(body, &vctmDoc); err != nil {
-		f.logger.Debug("could not extract fields from VCTM document",
-			zap.String("url", vctmURI), zap.Error(err))
-	}
-
-	// Fall back to the schemaURI when the document does not carry a "vct" field.
-	vct := vctmDoc.VCT
-	if vct == "" {
-		f.logger.Debug("VCTM document has no 'vct' field, falling back to schemaURI",
-			zap.String("url", vctmURI))
-		vct = vctmURI
+	header := parseDocumentHeader(body)
+	id := header.identifier()
+	if id == "" {
+		f.logger.Debug("schema document has no 'vct' or 'doctype' field, falling back to its URI",
+			zap.String("url", docURI))
+		id = docURI
 	}
 
 	return &VCTMEntry{
-		VCT:              vct,
-		Name:             vctmDoc.Name,
-		Description:      vctmDoc.Description,
+		VCT:              id,
+		Name:             header.displayName(),
+		Description:      header.displayDescription(),
 		Metadata:         json.RawMessage(body),
 		AttestationLoS:   schema.AttestationLoS,
 		BindingType:      schema.BindingType,
@@ -544,7 +528,7 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 	}
 
 	f.logger.Info("fetched registry index",
-		zap.String("url", source.resolveURL()),
+		zap.String("url", resolveSourceURL(&source)),
 		zap.Int("credentials", len(resp.Credentials)))
 
 	entries := make(map[string]*VCTMEntry)
@@ -565,24 +549,27 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 		// Try to fetch TS11 detail for this credential (includes schemaURIs).
 		detailURL := baseURL + "/api/v1/schemas/" + cred.ID + ".json"
 		detailBody, err := f.fetchRaw(ctx, detailURL)
+		fetchedAny := false
 		if err == nil {
-			// Successfully fetched detail — process as TS11 schema with VCTM fetch.
+			// Successfully fetched detail — fetch every format's document,
+			// not just one, so an mso_mdoc variant alongside a dc+sd-jwt
+			// variant is also cached (see processTS11Response for why).
 			var schema TS11SchemaMeta
 			if jsonErr := json.Unmarshal(detailBody, &schema); jsonErr == nil && len(schema.SchemaURIs) > 0 {
-				// Pick the VCTM URI
-				var vctmURI string
 				for _, su := range schema.SchemaURIs {
-					if su.FormatIdentifier == "dc+sd-jwt" {
-						vctmURI = su.URI
-						break
+					entry, fetchErr := f.fetchSchemaDocument(ctx, schema, su.URI)
+					if fetchErr != nil {
+						errorCount++
+						f.logger.Debug("failed to fetch schema document from detail",
+							zap.String("id", cred.ID), zap.String("format", su.FormatIdentifier), zap.Error(fetchErr))
+						continue
 					}
-				}
-				if vctmURI == "" {
-					vctmURI = schema.SchemaURIs[0].URI
-				}
-
-				entry, fetchErr := f.fetchTS11VCTM(ctx, schema, vctmURI)
-				if fetchErr == nil {
+					// The document was fetched successfully — this credential
+					// has real TS11 detail, whether or not the filter admits
+					// it. Set fetchedAny before the filter check so a
+					// filtered-out credential doesn't fall through to the
+					// stub fallback below and reappear keyed by schema ID.
+					fetchedAny = true
 					if !f.config.Filter.Matches(entry.VCT) {
 						filteredCount++
 						continue
@@ -590,15 +577,17 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 					entries[entry.VCT] = entry
 					fetchedCount++
 					detailCount++
-					continue
 				}
-				f.logger.Debug("failed to fetch VCTM from detail", zap.String("id", cred.ID), zap.Error(fetchErr))
 			}
 		}
+		if fetchedAny {
+			continue
+		}
 
-		// Detail not available (non-TS11) or VCTM fetch failed.
-		// Create a stub entry with the metadata we have from the registry list.
-		// Use the schema ID as a placeholder VCT (the real VCT is unknown without VCTM).
+		// No TS11 detail available (non-TS11 entry) or every format's fetch
+		// failed outright. Create a stub entry with the metadata we have
+		// from the registry list. Use the schema ID as a placeholder
+		// identifier (the real vct/doctype is unknown without the document).
 		vct := cred.ID
 		if !f.config.Filter.Matches(vct) {
 			filteredCount++
@@ -617,7 +606,7 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 	}
 
 	f.logger.Info("registry fetch complete",
-		zap.String("url", source.resolveURL()),
+		zap.String("url", resolveSourceURL(&source)),
 		zap.Int("fetched", fetchedCount),
 		zap.Int("detail", detailCount),
 		zap.Int("stubs", stubCount),

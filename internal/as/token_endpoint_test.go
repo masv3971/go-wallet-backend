@@ -1,0 +1,1094 @@
+package as
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+)
+
+func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
+	t.Helper()
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, nil, nil)
+	return router, store, issuer
+}
+
+// newTestTokenIssuer builds a TokenIssuer backed by a freshly generated
+// signing key, independent of any particular router - so a test can mint a
+// token with one TokenIssuer and then verify a blacklist/audience check
+// against it using a second, separately configured router that still trusts
+// the same key (see TestTokenEndpoint_Delegation_RevokedParentDenied).
+func newTestTokenIssuer(t *testing.T) *TokenIssuer {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "ec.pem")
+	f, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+	f.Close()
+
+	km, err := NewKeyManager(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return NewTokenIssuer(km, "test-issuer", func(aud string) time.Duration {
+		return 2 * time.Minute
+	})
+}
+
+// setupRouterWithIssuer wires the /auth/token endpoint using the given
+// issuer, accepted audiences and blacklist.
+func setupRouterWithIssuer(t *testing.T, issuer *TokenIssuer, audiences []string, blacklist TokenBlacklistChecker) (*gin.Engine, *MemorySessionStore) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	store := NewMemorySessionStore()
+	logger := zap.NewNop()
+
+	router := gin.New()
+	group := router.Group("/auth")
+	RegisterTokenEndpoint(group, TokenEndpointConfig{
+		Store:           store,
+		Issuer:          issuer,
+		Policy:          AllowAllPolicy{},
+		TTLFunc:         func(aud string) time.Duration { return 2 * time.Minute },
+		Audiences:       audiences,
+		Blacklist:       blacklist,
+		InsecureCookies: true,
+		Logger:          logger,
+	})
+
+	return router, store
+}
+
+// setupTokenEndpointWithDeps is setupTokenEndpoint but lets a test supply
+// the accepted audiences and a blacklist for delegation-exchange checks
+// (#381), rather than always skipping them the way setupTokenEndpoint does.
+func setupTokenEndpointWithDeps(t *testing.T, audiences []string, blacklist TokenBlacklistChecker) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
+	t.Helper()
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, audiences, blacklist)
+	return router, store, issuer
+}
+
+func TestTokenEndpoint_Success(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-1",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		ACR:       "urn:siros:acr:passkey",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "backend-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-1"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.AccessToken == "" {
+		t.Error("expected non-empty access_token")
+	}
+	if resp.TokenType != "Bearer" {
+		t.Errorf("expected Bearer, got %s", resp.TokenType)
+	}
+	if resp.ExpiresIn != 120 {
+		t.Errorf("expected expires_in 120, got %d", resp.ExpiresIn)
+	}
+}
+
+func TestTokenEndpoint_NoSession(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+}
+
+func TestTokenEndpoint_TACExceedsSession(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-2",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Request write permission when session only allows read+list.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "w"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-2"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestTokenEndpoint_PolicyDenied(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Generate signing key.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "ec.pem")
+	f, err := os.Create(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = pem.Encode(f, &pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+	f.Close()
+
+	km, err := NewKeyManager(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuer := NewTokenIssuer(km, "test-issuer", func(aud string) time.Duration {
+		return 2 * time.Minute
+	})
+
+	store := NewMemorySessionStore()
+	logger := zap.NewNop()
+
+	// Use a deny-all policy.
+	denyAll := &denyAllPolicy{}
+
+	router := gin.New()
+	group := router.Group("/auth")
+	RegisterTokenEndpoint(group, TokenEndpointConfig{
+		Store:           store,
+		Issuer:          issuer,
+		Policy:          denyAll,
+		TTLFunc:         func(aud string) time.Duration { return 2 * time.Minute },
+		InsecureCookies: true,
+		Logger:          logger,
+	})
+
+	sess := &Session{
+		JTI:       "sess-deny",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-deny"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestTokenEndpoint_DefaultsTenantAndTAC(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-defaults",
+		UserID:    "user-1",
+		TenantID:  "tenant-default",
+		MaxTAC:    TAC("rl"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// No tenant_id or tac in request — should use session defaults.
+	body, _ := json.Marshal(TokenRequest{Audience: "api"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-defaults"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	// Verify the issued token has session defaults.
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"api"})
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+	if claims.TenantID != "tenant-default" {
+		t.Errorf("expected tenant_id tenant-default, got %s", claims.TenantID)
+	}
+	if claims.TAC != TAC("rl") {
+		t.Errorf("expected tac rl, got %s", claims.TAC)
+	}
+}
+
+// denyAllPolicy denies every request.
+type denyAllPolicy struct{}
+
+func (denyAllPolicy) Evaluate(_ string) (bool, error) { return false, nil }
+func (denyAllPolicy) RuleCount() int                  { return 0 }
+
+func TestTokenEndpoint_EmptyMaxTAC(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	// Session with empty MaxTAC — should deny all token requests.
+	sess := &Session{
+		JTI:       "sess-no-perms",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC(""),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-no-perms"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for empty MaxTAC, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_InvalidTAC(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-invalid-tac",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwlx"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Request with invalid character 'x' — should fail validation.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "x"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-invalid-tac"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid TAC, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_EmptyAudience(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-no-aud",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-no-aud"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty audience, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- Delegation tests ---
+
+func TestTokenEndpoint_Delegation_Success(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Issue a parent token with 'k' (delegate) permission.
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Request a delegation token with downscoped TAC.
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "rl"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	// Verify the delegated token is properly downscoped.
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"downstream-api"})
+	if err != nil {
+		t.Fatalf("parse delegated token: %v", err)
+	}
+	if claims.TenantID != "tenant-1" {
+		t.Errorf("expected tenant_id tenant-1, got %s", claims.TenantID)
+	}
+	if claims.TAC != TAC("rl") {
+		t.Errorf("expected tac rl, got %s", claims.TAC)
+	}
+	if claims.Subject != "user-1" {
+		t.Errorf("expected subject user-1, got %s", claims.Subject)
+	}
+}
+
+func TestTokenEndpoint_Delegation_DefaultTACStripsK(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Request with no TAC — should default to parent's TAC minus 'k'.
+	body, _ := json.Marshal(TokenRequest{Audience: "api"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"api"})
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+	if claims.TAC.Has(TACDelegate) {
+		t.Error("default delegated token should not have 'k' permission")
+	}
+	if claims.TAC != TAC("rwl") {
+		t.Errorf("expected tac rwl, got %s", claims.TAC)
+	}
+}
+
+func TestTokenEndpoint_Delegation_NoKPermission(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Parent token without 'k' — delegation should be denied.
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwl"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_TACExceedsParent(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Parent has rwlk, request asks for 'i' which parent doesn't have.
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "ri"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_CrossTenantDenied(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to delegate to a different tenant.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "tenant-2", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant delegation, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_ReDelegation(t *testing.T) {
+	router, _, issuer := setupTokenEndpoint(t)
+
+	// Parent has 'k' — explicitly request 'k' in delegated token (re-delegation).
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "rk"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for re-delegation, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, []string{"api"})
+	if err != nil {
+		t.Fatalf("parse token: %v", err)
+	}
+	if !claims.TAC.Has(TACDelegate) {
+		t.Error("re-delegated token should have 'k' permission")
+	}
+}
+
+// fakeBlacklist is a minimal TokenBlacklistChecker test double: a fixed set
+// of jtis considered revoked, and a fixed set of revoked user IDs. Add
+// records what was added, for tests that need to assert on it.
+type fakeBlacklist struct {
+	revoked      map[string]bool
+	revokedUsers map[string]bool
+	added        map[string]time.Time
+	families     map[string]time.Time
+	familyErr    error
+}
+
+func (f *fakeBlacklist) RevokeFamily(ctx context.Context, sid string, expiry time.Time) error {
+	if f.familyErr != nil {
+		return f.familyErr
+	}
+	if f.families == nil {
+		f.families = make(map[string]time.Time)
+	}
+	if existing, ok := f.families[sid]; ok && existing.After(expiry) {
+		expiry = existing
+	}
+	f.families[sid] = expiry
+	return nil
+}
+
+func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
+	return f.revoked[jti]
+}
+
+func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
+	return f.revokedUsers[userID]
+}
+
+func (f *fakeBlacklist) Add(ctx context.Context, jti string, expiry time.Time) error {
+	if f.added == nil {
+		f.added = make(map[string]time.Time)
+	}
+	f.added[jti] = expiry
+	if f.revoked == nil {
+		f.revoked = make(map[string]bool)
+	}
+	f.revoked[jti] = true
+	return nil
+}
+
+func TestTokenEndpoint_Delegation_WrongAudienceDenied(t *testing.T) {
+	// Only "wallet-backend" is an accepted audience for this AS - matches
+	// how cfg.AS.Audiences restricts every other token operation (see
+	// NewBackendProvider).
+	router, _, issuer := setupTokenEndpointWithDeps(t, []string{"wallet-backend"}, nil)
+
+	// Parent token was minted for a different audience entirely.
+	parentToken, err := issuer.Issue("user-1", "some-other-service", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong-audience parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_MatchingAudienceAllowed(t *testing.T) {
+	// Sanity check for the test above: the same restricted-audiences setup
+	// still allows delegation when the parent token's audience is accepted.
+	router, _, issuer := setupTokenEndpointWithDeps(t, []string{"wallet-backend"}, nil)
+
+	parentToken, err := issuer.Issue("user-1", "wallet-backend", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for matching-audience parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_RevokedParentDenied(t *testing.T) {
+	// Same issuer/signing key used for both the token that gets minted and
+	// the router that verifies it - only the blacklist differs - so the
+	// rejection below is actually caused by the revocation check, not a
+	// signature mismatch from using two unrelated keys.
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentClaims, err := issuer.ParseAndVerify(parentToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent token's own jti is already revoked (mirrors a
+	// Logout/DeleteUser having blacklisted it - #382/#383).
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revoked: map[string]bool{parentClaims.ID: true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for revoked parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_NonRevokedParentAllowed(t *testing.T) {
+	// Sanity check for the test above: the same blacklist wiring still
+	// allows delegation when the parent token's jti isn't on it.
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revoked: map[string]bool{"some-other-jti": true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-revoked parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Delegation_RevokedUserDenied proves the #391 review
+// fix: a delegation-capable token whose OWN jti was never individually
+// blacklisted is still rejected once its subject (user) has been revoked
+// in bulk (see service.TokenBlacklist.RevokeUser / UserService.DeleteUser)
+// - checking the parent's jti alone missed this.
+func TestTokenEndpoint_Delegation_RevokedUserDenied(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent token's jti is NOT individually blacklisted, but its
+	// subject ("user-1") has been bulk-revoked.
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revokedUsers: map[string]bool{"user-1": true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a revoked user's parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_CrossTenantDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-tenant",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Try to request a token for a different tenant.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "tenant-other", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-tenant"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant session token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_CrossTenantAllowedForWildcard(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	// Cross-tenant session (admin) can issue tokens for any tenant.
+	sess := &Session{
+		JTI:       "sess-admin",
+		UserID:    "admin-1",
+		TenantID:  "*",
+		MaxTAC:    TAC("rwlida"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TenantID: "any-tenant", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-admin"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for wildcard session, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_AnonymousPriorityOverSession(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
+
+	// Create a session so a session cookie is present. ACR is required -
+	// handleAnonymousTokenRequest still requires a real, already-
+	// authenticated session; "anonymous" only omits "sub" from the token.
+	sess := &Session{
+		JTI:       "sess-anon-priority",
+		UserID:    "user-123",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rw"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Request with Anonymous=true AND a valid session cookie.
+	// Anonymous flag must take priority.
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-priority"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for anonymous with session cookie, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Parse the issued token and verify it has no subject (anonymous).
+	var resp TokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.Subject != "" {
+		t.Errorf("expected empty subject for anonymous token, got %q", claims.Subject)
+	}
+}
+
+// TestTokenEndpoint_AnonymousDefaultsToSessionTenant is a regression test
+// for a design change: an anonymous request without an explicit tenant_id
+// used to always get "default", regardless of who was asking - because the
+// old implementation had no session to fall back to. Now that
+// handleAnonymousTokenRequest requires a real session (see
+// TestTokenEndpoint_Anonymous_NoSessionDenied), it defaults to that
+// session's own tenant instead, exactly like handleSessionTokenRequest -
+// the "default" tenant is not given any special treatment.
+func TestTokenEndpoint_AnonymousDefaultsToSessionTenant(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-tenant",
+		UserID:    "user-1",
+		TenantID:  "tenant-acme",
+		MaxTAC:    TAC("rwl"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	// Anonymous request without explicit tenant_id should get the session's
+	// own tenant - not "default".
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-tenant"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp TokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.TenantID != "tenant-acme" {
+		t.Errorf("expected tenant_id %q (the session's own tenant), got %q", "tenant-acme", claims.TenantID)
+	}
+	if claims.Subject != "" {
+		t.Errorf("expected empty subject (identity-free), got %q", claims.Subject)
+	}
+}
+
+// TestTokenEndpoint_Anonymous_NoSessionDenied is a regression test for the
+// core design fix: "anonymous" means the issued token omits the caller's
+// identity, not that no authentication is required at all. A caller with no
+// session must be rejected before SPOCP is even consulted.
+func TestTokenEndpoint_Anonymous_NoSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// No session cookie.
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for anonymous request with no session, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_NoACRDenied covers a session that somehow has
+// no ACR - should be unreachable via any real login flow, but
+// handleAnonymousTokenRequest must fail closed rather than mint a token
+// with no authentication context behind it at all.
+func TestTokenEndpoint_Anonymous_NoACRDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-no-acr",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+		// ACR deliberately left empty.
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-no-acr"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a session with no ACR, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_CrossTenantDenied mirrors
+// TestTokenEndpoint_CrossTenantDenied for the anonymous path: tenant scoping
+// is enforced identically, in code, regardless of whether the issued token
+// carries the caller's identity.
+func TestTokenEndpoint_Anonymous_CrossTenantDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-cross-tenant",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwl"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true, TenantID: "tenant-other", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-cross-tenant"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant anonymous token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_WriteTACDenied is a regression test: an
+// anonymous token must be read-only regardless of what the caller's own
+// session MaxTAC would otherwise permit - the point of this path is a
+// narrowly-scoped, identity-free token, not "everything my session can do,
+// minus my name".
+func TestTokenEndpoint_Anonymous_WriteTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-write",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwlidka"), // full permissions
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true, TAC: "w"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-write"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for anonymous request with tac=w, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_InvalidSessionDenied covers a session cookie
+// that doesn't resolve to a real session (expired/never existed) - distinct
+// from TestTokenEndpoint_Anonymous_NoSessionDenied, which covers no cookie
+// at all.
+func TestTokenEndpoint_Anonymous_InvalidSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-does-not-exist"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a session cookie that doesn't resolve, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_EmptyMaxTACDenied covers a session with no
+// granted permissions at all - mirrors the equivalent check on the
+// authenticated path.
+func TestTokenEndpoint_Anonymous_EmptyMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-empty-maxtac",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC(""),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-empty-maxtac"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a session with no granted permissions, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied is distinct from
+// TestTokenEndpoint_Anonymous_WriteTACDenied: that test's requested tac
+// ("w") fails the read-only cap before session.MaxTAC is even consulted.
+// This one requests a tac that passes the read-only cap ("r", the default)
+// but still exceeds what this specific session's own MaxTAC ("l" only, no
+// "r") permits - a session with only list access can't be used to mint even
+// a read-only-scoped anonymous token.
+func TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-anon-list-only",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("l"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", Anonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-anon-list-only"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a session whose MaxTAC (l) doesn't include the default anonymous tac (r), got %d: %s", w.Code, w.Body.String())
+	}
+}

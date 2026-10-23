@@ -33,9 +33,8 @@ func setupTestHandlersWithUser(t *testing.T) (*Handlers, *gin.Engine, *domain.Us
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 
@@ -215,6 +214,16 @@ func TestHandlers_GetAccountInfo_Success(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	// Password authentication was removed (#162): the raw JSON must not
+	// carry hasPassword, which unmarshalling into the struct would hide.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("Failed to parse raw response: %v", err)
+	}
+	if _, present := raw["hasPassword"]; present {
+		t.Error("account info must not include hasPassword")
 	}
 
 	var response AccountInfoResponse
@@ -415,9 +424,8 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 

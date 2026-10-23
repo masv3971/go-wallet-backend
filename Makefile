@@ -1,23 +1,19 @@
 # Go Wallet Backend
 
-.PHONY: help build run test clean docker-build docker-run man install-man
+.PHONY: help build run test clean docker-build docker-build-pkcs11 docker-build-softhsm docker-run man install-man gen-config-docs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 build: ## Build the server binary
 	@echo "Building server..."
-	@go build -o bin/server cmd/server/main.go
-
-build-registry: ## Build the registry server binary
-	@echo "Building registry server..."
-	@go build -o bin/registry cmd/registry/main.go
+	@go build -o bin/server ./cmd/server
 
 build-admin: man ## Build the wallet-admin CLI tool (includes man page)
 	@echo "Building wallet-admin CLI..."
 	@go build -o bin/wallet-admin ./cmd/wallet-admin
 
-build-all: build build-registry build-admin ## Build all binaries
+build-all: build build-admin ## Build all binaries
 
 man: ## Copy man pages to bin directory
 	@echo "Copying man pages..."
@@ -33,9 +29,9 @@ run: build ## Build and run the server
 	@echo "Running server..."
 	@./bin/server
 
-run-registry: build-registry ## Build and run the registry server
-	@echo "Running registry server..."
-	@./bin/registry
+run-registry: build ## Build and run the server with only the registry role
+	@echo "Running registry role..."
+	@./bin/server --mode=registry --config configs/config.registry.yaml
 
 dev: ## Run with hot reload (requires air)
 	@echo "Running in development mode..."
@@ -68,6 +64,10 @@ lint: ## Run linter
 	@echo "Running linter..."
 	@golangci-lint run
 
+spec-check: ## Verify OpenAPI spec covers all registered routes
+	@echo "Checking OpenAPI spec coverage..."
+	@go test ./docs/ -count=1 -timeout 30s -run 'TestAdminOpenAPI|TestOpenAPISpec'
+
 clean: ## Clean build artifacts
 	@echo "Cleaning..."
 	@rm -rf bin/
@@ -79,7 +79,14 @@ docker-build: ## Build Docker image
 	@echo "Building Docker image..."
 	@docker build -t go-wallet-backend:latest .
 
-docker-build-registry: ## Build Docker image for registry server
+docker-build-pkcs11: ## Build the PKCS#11-capable image (CGO, -tags pkcs11; mount your HSM module)
+	@echo "Building PKCS#11 Docker image..."
+	@docker build -f Dockerfile.pkcs11 -t go-wallet-backend:pkcs11 .
+
+docker-build-softhsm: ## Build the DEV-ONLY SoftHSM image (see docker-compose.softhsm.yml)
+	@docker build -f Dockerfile.pkcs11 --target softhsm -t go-wallet-backend:softhsm .
+
+docker-build-registry: ## Build the go-wallet-registry helper image (main binary, --mode=registry)
 	@echo "Building registry Docker image..."
 	@docker build -f Dockerfile.registry -t go-wallet-registry:latest .
 
@@ -135,5 +142,9 @@ init-db: ## Initialize database (for SQLite)
 	@echo "Initializing database..."
 	@rm -f wallet.db
 	@./bin/server --init-db
+
+gen-config-docs: ## Generate docs/CONFIGURATION.md from Go structs
+	@echo "Generating configuration reference..."
+	@go run developer_tools/scripts/gen_config_docs/main.go
 
 .DEFAULT_GOAL := help

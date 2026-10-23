@@ -1,0 +1,74 @@
+package as
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// oidcTokenResponse is the response from the OIDC token endpoint.
+type oidcTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	IDToken      string `json:"id_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	ExpiresIn    int    `json:"expires_in,omitempty"`
+}
+
+// exchangeCode exchanges an authorization code for tokens at the OIDC token endpoint.
+// Uses public client mode (no client_secret); codeVerifier is the PKCE
+// code_verifier generated at /auth/oidc/login and must be non-empty (see
+// go-wallet-backend#373 / M-1) - without it, an authorization code
+// intercepted in transit (e.g. via an open redirect or a leaky referrer)
+// could be redeemed by an attacker who never had a client secret to begin
+// with, since this is a public client.
+func exchangeCode(ctx context.Context, client *http.Client, tokenEndpoint, code, clientID, redirectURI, codeVerifier string) (*oidcTokenResponse, error) {
+	data := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {code},
+		"client_id":     {clientID},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {codeVerifier},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("as: failed to create token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("as: token exchange request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
+	if err != nil {
+		return nil, fmt.Errorf("as: failed to read token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("as: token endpoint returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp oidcTokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, fmt.Errorf("as: failed to parse token response: %w", err)
+	}
+
+	if tokenResp.IDToken == "" {
+		return nil, fmt.Errorf("as: token response missing id_token")
+	}
+
+	return &tokenResp, nil
+}

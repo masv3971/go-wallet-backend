@@ -24,8 +24,24 @@ import (
 func newTestResolver(t *testing.T) *Resolver {
 	t.Helper()
 	r, err := New(Config{
-		CacheTTL:  5 * time.Minute,
-		AllowHTTP: true,
+		CacheTTL:     5 * time.Minute,
+		AllowHTTP:    true,
+		MetadataType: MetadataTypeAny, // one request, no staging
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	return r
+}
+
+// newTestResolverPreferSigned returns a resolver with the default staged
+// prefer-signed policy.
+func newTestResolverPreferSigned(t *testing.T) *Resolver {
+	t.Helper()
+	r, err := New(Config{
+		CacheTTL:     5 * time.Minute,
+		AllowHTTP:    true,
+		MetadataType: MetadataTypePreferSigned,
 	})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -86,16 +102,16 @@ func inlineJWKS(t *testing.T, pub jose.JSONWebKey) map[string]interface{} {
 // TestResolve_NoSignedMetadata verifies that plain (unsigned) metadata is
 // returned as-is when signed_metadata is absent.
 func TestResolve_NoSignedMetadata(t *testing.T) {
-	meta := map[string]interface{}{
-		"credential_issuer": "https://issuer.example.com",
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/openid-credential-issuer" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(meta) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": server.URL,
+		})
 	}))
 	defer server.Close()
 
@@ -104,8 +120,59 @@ func TestResolve_NoSignedMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
-	if got["credential_issuer"] != "https://issuer.example.com" {
+	if got["credential_issuer"] != server.URL {
 		t.Errorf("credential_issuer: got %v", got["credential_issuer"])
+	}
+}
+
+// TestResolve_CredentialIssuerMismatch verifies that a plain-JSON metadata
+// document whose credential_issuer claim does not match the requested issuer
+// URL is rejected (M-5 fix: bind unsigned metadata to the requested issuer).
+func TestResolve_CredentialIssuerMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": "https://attacker.example.com",
+		})
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("expected error for credential_issuer mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("expected 'does not match' in error, got: %v", err)
+	}
+}
+
+// TestResolve_CredentialIssuerMissing verifies that a plain-JSON metadata
+// document with no credential_issuer claim at all is rejected.
+func TestResolve_CredentialIssuerMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_endpoint": "https://issuer.example.com/credential",
+		})
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("expected error for missing credential_issuer claim, got nil")
+	}
+	if !strings.Contains(err.Error(), "credential_issuer") {
+		t.Errorf("expected 'credential_issuer' in error, got: %v", err)
 	}
 }
 
@@ -389,10 +456,11 @@ func TestResolve_SignedMetadata_KIDSelection(t *testing.T) {
 
 func TestResolve_Cached(t *testing.T) {
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -410,9 +478,10 @@ func TestResolve_Cached(t *testing.T) {
 }
 
 func TestResolve_TrailingSlashStripped(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -474,12 +543,157 @@ func TestResolve_RejectsNonOKStatus(t *testing.T) {
 	}
 }
 
+// TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON covers issuers that
+// reject the application/jwt Accept with 406 instead of serving the acceptable
+// JSON representation: the resolver retries once requesting unsigned JSON.
+func TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON(t *testing.T) {
+	var attempts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if strings.HasPrefix(r.Header.Get("Accept"), "application/jwt") {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	res, err := r.ResolveWithInfo(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("expected unsigned fallback to succeed, got error: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 requests (signed rejected, unsigned retry), got %d", attempts)
+	}
+	if res.Signed {
+		t.Error("fallback result must be reported as unsigned")
+	}
+	if res.Metadata["credential_issuer"] != server.URL {
+		t.Errorf("unexpected metadata: %v", res.Metadata)
+	}
+}
+
+// TestResolve_SignedNotAcceptable_BothFail verifies the unsigned retry is not
+// infinite: when the issuer 406s both representations, the error surfaces.
+func TestResolve_SignedNotAcceptable_BothFail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error when both signed and unsigned requests return 406")
+	}
+}
+
+// TestResolve_PreferUnsigned_RetriesSignedOn406 verifies that when unsigned
+// metadata is preferred and the issuer 406s the JSON request, the resolver
+// retries once with application/jwt before surfacing the error.
+func TestResolve_PreferUnsigned_RetriesSignedOn406(t *testing.T) {
+	var accepts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepts = append(accepts, r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r, err := New(Config{AllowHTTP: true, MetadataType: MetadataTypePreferUnsigned})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error when both representations return 406")
+	}
+	if len(accepts) != 2 {
+		t.Fatalf("expected 2 requests (json then signed retry), got %d: %v", len(accepts), accepts)
+	}
+	if accepts[0] != "application/json" || accepts[1] != "application/jwt" {
+		t.Errorf("unexpected Accept sequence: %v", accepts)
+	}
+}
+
+// TestResolve_NotAcceptable_RetriesOtherRepresentation verifies that with the
+// fallback on, a 406 on the preferred representation triggers exactly one retry
+// with the other media type (#371).
+func TestResolve_NotAcceptable_RetriesOtherRepresentation(t *testing.T) {
+	var accepts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepts = append(accepts, r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error for 406 on both representations")
+	}
+	if len(accepts) != 2 || accepts[0] != "application/jwt" || accepts[1] != "application/json" {
+		t.Errorf("a 406 must trigger exactly one retry with the other media type; got %v", accepts)
+	}
+}
+
+// TestResolve_TerminalStatuses_NoRetry verifies statuses that are not a
+// 406 are terminal even with the fallback on: other 4xx (400, 401, 403, 404,
+// 415, 451), 429 (a retry only adds load), redirects without a Location, and 5xx.
+func TestResolve_TerminalStatuses_NoRetry(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 404, 415, 429, 451, 500, 502, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var attempts int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			r := newTestResolverPreferSigned(t)
+			if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+				t.Errorf("expected error for %d", status)
+			}
+			if attempts != 1 {
+				t.Errorf("%d must not trigger a retry; got %d requests", status, attempts)
+			}
+		})
+	}
+}
+
+// TestResolve_ClientErrorThenOK_Succeeds verifies the point of the fallback: a
+// 406 on the first representation followed by 200 on the second resolves.
+func TestResolve_NotAcceptableThenOK_Succeeds(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if r.Header.Get("Accept") == "application/jwt" {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential_issuer":"` + "http://" + r.Host + `","credential_endpoint":"http://x/c"}`))
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err != nil {
+		t.Fatalf("expected the unsigned retry to succeed, got %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 requests, got %d", attempts)
+	}
+}
+
 func TestResolve_CacheTTLExpiry(t *testing.T) {
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int{"call": calls}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": server.URL,
+			"call":              calls,
+		})
 	}))
 	defer server.Close()
 
@@ -649,9 +863,10 @@ func TestResolveWithInfo_NotValidated_SignedWithoutEvaluator(t *testing.T) {
 // TestResolveWithInfo_NotValidated_UnsignedJSON verifies that ResolveWithInfo
 // reports Validated=false for plain unsigned JSON.
 func TestResolveWithInfo_NotValidated_UnsignedJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -960,11 +1175,10 @@ func TestResolve_AcceptHeader(t *testing.T) {
 	resolver, _ := New(Config{AllowHTTP: true})
 	resolver.Resolve(context.Background(), server.URL) //nolint:errcheck
 
-	if !strings.Contains(acceptHeader, "application/jwt") {
-		t.Errorf("expected Accept header to include application/jwt, got %q", acceptHeader)
-	}
-	if !strings.Contains(acceptHeader, "application/json") {
-		t.Errorf("expected Accept header to include application/json, got %q", acceptHeader)
+	// Default is prefer-signed: the first request advertises only
+	// application/jwt. Unsigned JSON is requested separately, only after a 406.
+	if acceptHeader != "application/jwt" {
+		t.Errorf("expected preferred Accept header application/jwt, got %q", acceptHeader)
 	}
 }
 
@@ -1018,5 +1232,25 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "trust engine unavailable") {
 		t.Errorf("expected propagated error, got: %v", err)
+	}
+}
+
+// The fallback is on by default (#371): a resolver built without saying so
+// retries the other media type after a 406.
+func TestResolve_FallbackOnByDefault(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r, err := New(Config{AllowHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = r.Resolve(context.Background(), server.URL)
+	if attempts != 2 {
+		t.Errorf("default must retry once after a 406; got %d requests", attempts)
 	}
 }

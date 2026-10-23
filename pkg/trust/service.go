@@ -8,6 +8,7 @@ package trust
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -215,7 +216,10 @@ func (s *Service) resolveVerifierEndpoint(sessionEndpoint string) string {
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
-	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, keyMaterial, "issuer")
+	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "issuer",
+	})
 }
 
 // EvaluateVerifier evaluates trust for a credential verifier via the trust endpoint.
@@ -228,11 +232,101 @@ func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndp
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
-	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, keyMaterial, "verifier")
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "verifier",
+	})
 }
 
-// evaluate is the shared implementation for both issuer and verifier trust evaluation.
-func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, keyMaterial *KeyMaterial, logLabel string) (*TrustInfo, error) {
+// EvaluateVerifierWithContext is EvaluateVerifier plus caller-supplied
+// AuthZEN evaluation context, forwarded to the PDP as-is (see
+// authzen.Evaluator.toAuthZENRequest, which puts it straight on the
+// outbound AuthZEN request's Context field).
+//
+// This exists so a direct-to-PDP evaluation (see
+// OID4VPHandler.evaluateVerifierTrustViaPDP) doesn't silently drop context
+// a frontend-mediated evaluation has always carried in
+// TrustEvaluationRequest.Context - in particular an OIDF trust_chain (OID4VP
+// §5.9.3.6) or verifier_attestation issuer/JWT fields (OID4VP §5.9.3.4),
+// both of which go-trust's PDP may need to validate a request that a bare
+// subject+key-material evaluation cannot.
+func (s *Service) EvaluateVerifierWithContext(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial, evalContext map[string]interface{}) (*TrustInfo, error) {
+	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "verifier",
+		evalContext: evalContext,
+	})
+}
+
+// FIDO2AttestationAction is the AuthZEN action.name sent for FIDO2/CTAP2
+// hardware-attestation evaluation. It matches go-trust's own documented
+// policy-name convention for this exact use case (see go-trust's README,
+// "wscd-previewsign-provision" policy example under the fidomds3 registry
+// section), so an operator can attach a distinct FIDO MDS3 AAGUID allow/
+// blocklist policy to this call site without it falling back to whatever
+// default_policy is configured for unmatched action names.
+const FIDO2AttestationAction = "wscd-previewsign-provision"
+
+// EvaluateFIDO2Attestation evaluates a FIDO2/CTAP2 hardware-key attestation's
+// x5c certificate chain against the global PDP (expected to have a fidomds3
+// registry configured - see go-trust's pkg/registry/fidomds3). Unlike issuer/
+// verifier evaluation, this has no per-flow endpoint override - FIDO Alliance
+// MDS3 trust data is global, not tenant- or flow-specific.
+//
+// subjectID is the authenticator model's AAGUID (matches the "name" half of
+// the AuthZEN name-to-key binding the fidomds3 registry evaluates against).
+// If no PDP is configured, this fails closed (Trusted: false) - same as
+// EvaluateIssuer/EvaluateVerifier's "no PDP configured" behavior.
+//
+// Role is RoleAny here (there's no issuer/verifier role concept for a
+// hardware key), so the outbound action.name is set explicitly to
+// FIDO2AttestationAction instead - without this, evaluate() would send no
+// action.name at all, and go-trust could never target this call site with a
+// dedicated policy (e.g. an AAGUID allow/blocklist).
+func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x5cChain []string) (*TrustInfo, error) {
+	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, evaluateOptions{
+		action: FIDO2AttestationAction,
+		keyMaterial: &KeyMaterial{
+			Type: "x5c",
+			X5C:  x5cChain,
+		},
+		logLabel: "aaguid",
+	})
+}
+
+// evaluateOptions bundles evaluate's request-shaping parameters beyond the
+// required subject/endpoint/role, keeping evaluate's own parameter count
+// down (each field here used to be its own positional parameter).
+type evaluateOptions struct {
+	// action is an explicit AuthZEN action.name to send when role alone
+	// doesn't identify the call site (e.g. RoleAny). It's only applied when
+	// non-empty, and only when role itself is empty - see
+	// authzen.Evaluator.toAuthZENRequest, which prefers Role for
+	// action.name and falls back to this field. Leaving it empty preserves
+	// today's behavior for callers that rely on Role (EvaluateIssuer,
+	// EvaluateVerifier).
+	action string
+	// keyMaterial validates the subject-to-key binding when provided; nil
+	// performs resolution-only (only works for DIDs).
+	keyMaterial *KeyMaterial
+	// logLabel names the subject in this call site's log lines (e.g.
+	// "issuer", "verifier", "aaguid").
+	logLabel string
+	// evalContext, when non-nil, is forwarded as-is to
+	// EvaluationRequest.Context (see EvaluateVerifierWithContext's doc
+	// comment for why this exists).
+	evalContext map[string]interface{}
+}
+
+// evaluate is the shared implementation for issuer, verifier, and FIDO2
+// attestation trust evaluation. See evaluateOptions for opts' fields.
+func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, opts evaluateOptions) (*TrustInfo, error) {
+	action := opts.action
+	keyMaterial := opts.keyMaterial
+	logLabel := opts.logLabel
+	evalContext := opts.evalContext
+
 	eval, err := s.GetEvaluator(endpoint)
 	if err != nil {
 		return nil, err
@@ -256,6 +350,12 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	}
 	req.SubjectID = subjectID
 	req.Role = role
+	if role == "" && action != "" {
+		req.Action = action
+	}
+	if evalContext != nil {
+		req.Context = evalContext
+	}
 
 	// Set credential type if provided
 	if keyMaterial != nil && keyMaterial.CredentialType != "" {
@@ -337,4 +437,90 @@ func (s *Service) IsIssuerTrustEnabled() bool {
 // based on the current configuration.
 func (s *Service) IsVerifierTrustEnabled() bool {
 	return s.cfg.Trust.IsVerifierTrustEnabled()
+}
+
+// Resolver is an optional interface for evaluators that support resolution-only
+// requests (e.g., DID document resolution) without key validation.
+type Resolver interface {
+	Resolve(ctx context.Context, subjectID string) (*EvaluationResponse, error)
+}
+
+// ResolveDID resolves a DID via the verifier trust endpoint and returns the
+// verification method JWKs from the resolved DID Document.
+// Returns an error if no evaluator is configured, the evaluator doesn't support
+// resolution, or the DID cannot be resolved.
+func (s *Service) ResolveDID(ctx context.Context, did string, trustEndpoint string) ([]interface{}, error) {
+	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
+	eval, err := s.GetEvaluator(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trust evaluator: %w", err)
+	}
+	if eval == nil {
+		return nil, fmt.Errorf("no trust evaluator configured for DID resolution")
+	}
+
+	resolver, ok := eval.(Resolver)
+	if !ok {
+		return nil, fmt.Errorf("trust evaluator does not support DID resolution")
+	}
+
+	resp, err := resolver.Resolve(ctx, did)
+	if err != nil {
+		return nil, fmt.Errorf("DID resolution failed: %w", err)
+	}
+
+	if !resp.Decision {
+		return nil, fmt.Errorf("DID resolution denied: %s", resp.Reason)
+	}
+
+	return extractKeysFromTrustMetadata(resp.TrustMetadata), nil
+}
+
+// extractKeysFromTrustMetadata extracts JWK keys from a DID Document returned
+// as trust_metadata in an AuthZEN response.
+func extractKeysFromTrustMetadata(metadata interface{}) []interface{} {
+	if metadata == nil {
+		return nil
+	}
+
+	doc, ok := metadata.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	// DID Document verification methods are under "verificationMethod"
+	vmRaw, ok := doc["verificationMethod"]
+	if !ok {
+		return nil
+	}
+
+	vms, ok := vmRaw.([]interface{})
+	if !ok {
+		return nil
+	}
+
+	var keys []interface{}
+	for _, vm := range vms {
+		vmMap, ok := vm.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if jwk, ok := vmMap["publicKeyJwk"].(map[string]interface{}); ok {
+			// Copy kid from verification method id if not set on the JWK
+			if _, hasKid := jwk["kid"]; !hasKid {
+				if id, ok := vmMap["id"].(string); ok {
+					jwkCopy := make(map[string]interface{}, len(jwk)+1)
+					for k, v := range jwk {
+						jwkCopy[k] = v
+					}
+					jwkCopy["kid"] = id
+					keys = append(keys, jwkCopy)
+					continue
+				}
+			}
+			keys = append(keys, jwk)
+		}
+	}
+
+	return keys
 }

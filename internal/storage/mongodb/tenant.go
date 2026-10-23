@@ -33,7 +33,7 @@ func (s *TenantStore) Create(ctx context.Context, tenant *domain.Tenant) error {
 
 func (s *TenantStore) GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error) {
 	var tenant domain.Tenant
-	err := s.collection.FindOne(ctx, bson.M{"_id": string(id)}).Decode(&tenant)
+	err := s.collection.FindOne(ctx, idFilter(string(id))).Decode(&tenant)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return nil, storage.ErrNotFound
@@ -73,7 +73,7 @@ func (s *TenantStore) GetAllEnabled(ctx context.Context) ([]*domain.Tenant, erro
 
 func (s *TenantStore) Update(ctx context.Context, tenant *domain.Tenant) error {
 	tenant.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id": string(tenant.ID)}, tenant)
+	result, err := s.collection.ReplaceOne(ctx, idFilter(string(tenant.ID)), tenant)
 	if err != nil {
 		return fmt.Errorf("failed to update tenant: %w", err)
 	}
@@ -84,7 +84,7 @@ func (s *TenantStore) Update(ctx context.Context, tenant *domain.Tenant) error {
 }
 
 func (s *TenantStore) Delete(ctx context.Context, id domain.TenantID) error {
-	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": string(id)})
+	result, err := s.collection.DeleteOne(ctx, idFilter(string(id)))
 	if err != nil {
 		return fmt.Errorf("failed to delete tenant: %w", err)
 	}
@@ -165,10 +165,13 @@ func (s *UserTenantStore) GetTenantUsers(ctx context.Context, tenantID domain.Te
 }
 
 func (s *UserTenantStore) IsMember(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
-	count, err := s.collection.CountDocuments(ctx, bson.M{
-		"user_id":   userID.String(),
-		"tenant_id": string(tenantID),
-	})
+	// False positive: bson.M is a typed document builder, not a query string.
+	// Both map keys ("user_id", "tenant_id") are fixed literals; userID and
+	// tenantID are only ever used as plain field VALUES, BSON-encoded as
+	// strings and compared by equality. A string value can never be
+	// interpreted as a Mongo query operator (only "$"-prefixed map KEYS are),
+	// so untrusted input reaching this call site cannot inject query semantics.
+	count, err := s.collection.CountDocuments(ctx, bson.M{"user_id": userID.String(), "tenant_id": string(tenantID)}) // codeql[go/sql-injection]
 	if err != nil {
 		return false, fmt.Errorf("failed to check membership: %w", err)
 	}

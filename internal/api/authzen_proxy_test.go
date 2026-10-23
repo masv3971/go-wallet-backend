@@ -12,11 +12,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
+	"go.uber.org/zap"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -685,6 +686,51 @@ func TestResolve_URLSubject_NonHTTPS_Rejected(t *testing.T) {
 	}
 }
 
+func TestResolve_URLSubject_HTTPAllowed_WhenAllowHTTPSet(t *testing.T) {
+	// When allowHTTP is set (test/dev environments, e.g. docker-compose's
+	// http://vc-apigw:8080), plain HTTP subject_ids must not be rejected by
+	// the initial scheme validation - same escape hatch every other scheme
+	// check in this file already honors (jwks_uri, logo URLs, proxy dispatch).
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	handler, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, pdpHandler)
+	defer pdpServer.Close()
+	handler.allowHTTP = true
+
+	reqBody := map[string]interface{}{
+		"subject_id":   "http://vc-apigw:8080",
+		"subject_type": "url",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	// Assert the request actually succeeds, not merely that it isn't a 400 -
+	// a 403/500/502 would also clear a "not BadRequest" check while leaving
+	// the resolution just as broken as the bug this covers.
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp resolveURLResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if !resp.Decision {
+		t.Errorf("Expected decision true, got false: %s", w.Body.String())
+	}
+	if resp.Context == nil || resp.Context.TrustMetadata == nil {
+		t.Errorf("Expected trust_metadata in response, got: %s", w.Body.String())
+	}
+}
+
 func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 	// Integration test: subject.type="url" with an HTTPS URL must be authorized by
 	// the default SPOCP rules (Rule 5 added alongside the issuer-url registry).
@@ -738,6 +784,488 @@ func TestResolve_URLSubject_SPOCP_DefaultRules_Authorized(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status %d (url-type subject authorized by default SPOCP rules), got %d: %s",
 			http.StatusOK, w.Code, w.Body.String())
+	}
+}
+
+// ============================================================================
+// credential_offer_uri Resource Type Tests
+// ============================================================================
+
+func TestResolve_CredentialOfferURI_Success(t *testing.T) {
+	// A well-formed credential offer document served at the offer URI is returned
+	// in context.credential_offer, with decision=true and no PDP call.
+	offer := map[string]interface{}{
+		"credential_issuer": "https://issuer.example.com",
+		"credential_configuration_ids": []interface{}{
+			"UniversityDegreeCredential",
+		},
+		"grants": map[string]interface{}{
+			"urn:ietf:params:oauth:grant-type:pre-authorized_code": map[string]interface{}{
+				"pre-authorized_code": "abc123",
+			},
+		},
+	}
+
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(offer) //nolint:errcheck
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, offerServer.Client(), http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if resp["decision"] != true {
+		t.Errorf("Expected decision=true, got %v", resp["decision"])
+	}
+	ctx, ok := resp["context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected context object, got %T", resp["context"])
+	}
+	credOffer, ok := ctx["credential_offer"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected context.credential_offer object, got %T", ctx["credential_offer"])
+	}
+	if credOffer["credential_issuer"] != "https://issuer.example.com" {
+		t.Errorf("Expected credential_issuer='https://issuer.example.com', got %v", credOffer["credential_issuer"])
+	}
+}
+
+func TestResolve_CredentialOfferURI_NonHTTPS_Rejected(t *testing.T) {
+	// HTTP (non-HTTPS) subject_id must be rejected before any fetch is attempted.
+	_, router, pdpServer := setupAuthZENProxyHandler(t, &mockAuthorizer{allowAll: true}, nil)
+	if pdpServer != nil {
+		defer pdpServer.Close()
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "http://issuer.example.com/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_FetchFailure(t *testing.T) {
+	// If the offer URI cannot be fetched, return 502.
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	// Use a port that is not listening so the fetch will fail
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "https://127.0.0.1:1/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_InvalidJSON(t *testing.T) {
+	// If the offer endpoint returns invalid JSON, return 502.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("not valid json")) //nolint:errcheck
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, offerServer.Client(), http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_MissingCredentialIssuer(t *testing.T) {
+	// A JSON document without credential_issuer must be rejected with 502.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_configuration_ids": []string{"MyCredential"},
+		})
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, offerServer.Client(), http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_NonOKStatus(t *testing.T) {
+	// If the offer endpoint returns a non-200 status, return 502.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, offerServer.Client(), http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_RedirectToHTTP_Rejected(t *testing.T) {
+	// A redirect from the HTTPS offer endpoint to a plain HTTP URL must be refused.
+	// Set up a plain HTTP server that would receive the redirect target.
+	httpTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Should never be reached — the redirect must be refused before this.
+		t.Error("plain HTTP redirect target was reached; redirect hardening failed")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpTarget.Close()
+
+	// TLS server that redirects to the plain HTTP target.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, httpTarget.URL+"/offer", http.StatusFound)
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, offerServer.Client(), http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d (redirect refused), got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_CredentialOfferURI_ResponseTooLarge(t *testing.T) {
+	// A response body that exceeds 1MB must be rejected, not silently truncated.
+	offerServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Write 1MB+1 bytes of filler — enough to exceed the cap.
+		const limit = 1 << 20
+		w.Write(make([]byte, limit+1)) //nolint:errcheck
+	}))
+	defer offerServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, offerServer.Client(), http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    offerServer.URL + "/offer",
+		"subject_type":  "url",
+		"resource_type": "credential_offer_uri",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("Expected status %d (response too large), got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_UnknownResourceTypeURL_Rejected(t *testing.T) {
+	// An unknown resource_type for URL subjects must be rejected with 400,
+	// even if the SPOCP authorizer would otherwise permit it. Without this
+	// explicit allowlist, an unknown type silently falls through to the
+	// credential-issuer resolution path.
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{},
+		},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, nil, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    "https://issuer.example.com",
+		"subject_type":  "url",
+		"resource_type": "totally_unknown_type",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("Expected status %d for unknown resource_type, got %d: %s", http.StatusBadRequest, w.Code, w.Body.String())
+	}
+}
+
+// Regression test: resource_type="oauth-authorization-server" must actually
+// reach resolveAuthorizationServerMetadata, not get rejected by the
+// allowlist above it. Before the fix, this always 400ed, so
+// OpenID4VCIHelper.getAuthorizationServerMetadata (used by wallet-frontend
+// to decide whether to PAR a credential-issuance flow) could never see a
+// real issuer's pushed_authorization_request_endpoint - the wallet fell
+// back to an un-PARed authorize redirect even against a PAR-only AS.
+func TestResolve_URLSubject_OAuthAuthorizationServer_Success(t *testing.T) {
+	asServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/oauth-authorization-server" {
+			t.Errorf("unexpected well-known path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"issuer":                                "https://as.example.com",
+			"token_endpoint":                        "https://as.example.com/token",
+			"pushed_authorization_request_endpoint": "https://as.example.com/par",
+			"require_pushed_authorization_requests": true,
+		})
+	}))
+	defer asServer.Close()
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{Metadata: map[string]interface{}{}},
+	}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, asServer.Client(), asServer.Client(), logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    asServer.URL,
+		"subject_type":  "url",
+		"resource_type": "oauth-authorization-server",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Context struct {
+			TrustMetadata map[string]interface{} `json:"trust_metadata"`
+		} `json:"context"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v: %s", err, w.Body.String())
+	}
+	if resp.Context.TrustMetadata["pushed_authorization_request_endpoint"] != "https://as.example.com/par" {
+		t.Errorf("expected pushed_authorization_request_endpoint in trust_metadata, got: %v", resp.Context.TrustMetadata)
 	}
 }
 
@@ -1466,6 +1994,15 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 								},
 							},
 						},
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
+						},
+					},
+					"leaky": map[string]interface{}{
+						"format": "vc+sd-jwt",
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"ns": "00112233445566778899aabbccddeeff"},
+						},
 					},
 				},
 			},
@@ -1529,6 +2066,19 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 	credLogoURI := credLogo["uri"].(string)
 	if !strings.HasPrefix(credLogoURI, "data:image/png;base64,") {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
+	}
+
+	// A valid advertisement (names only) is public and is served; a malformed
+	// one (hex values) makes the configuration "not offered".
+	cm, _ := pid["credential_metadata"].(map[string]interface{})
+	if cm == nil || cm["org.siros.secret_seed"] == nil {
+		t.Error("valid org.siros.secret_seed advertisement must be served to the wallet")
+	}
+	if _, present := ccs["leaky"]; present {
+		t.Error("configuration with a malformed secret seed member must not be offered")
+	}
+	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
+		t.Error("seed value must never reach the wallet")
 	}
 }
 
@@ -1654,6 +2204,58 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("expected status %d for unverifiable signed_metadata JWT, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t *testing.T) {
+	// A legacy signed document keeps the original JWT in signed_metadata; its
+	// payload still carries a rejected configuration (with a seed value). When
+	// sanitisation removes the configuration the JWT must not be served either.
+	const seedHex = "00112233445566778899aabbccddeeff"
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+
+	cc := `{"leaky":{"format":"vc+sd-jwt","credential_metadata":{"org.siros.secret_seed":{"ns":"` + seedHex + `"}}}}`
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"credential_issuer":"https://signed.example.com","credential_configurations_supported":` + cc + `}`))
+	// No embedded key in the header: key material falls through to inline jwks.
+	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`)) + "." + payload + ".sig"
+	var ccs map[string]interface{}
+	if err := json.Unmarshal([]byte(cc), &ccs); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
+		Signed: true,
+		Metadata: map[string]interface{}{
+			"credential_issuer":                   "https://signed.example.com",
+			"jwks":                                map[string]interface{}{"keys": []interface{}{map[string]interface{}{"kty": "EC"}}},
+			"signed_metadata":                     jwt,
+			"credential_configurations_supported": ccs,
+		},
+	}}
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("tenant_id", "test-tenant"); c.Next() })
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{"subject_id": "https://signed.example.com", "subject_type": "url"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	for _, bad := range []string{seedHex, payload, "leaky", "signed_metadata"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("response must not contain %q", bad)
+		}
 	}
 }
 
@@ -1800,5 +2402,189 @@ func TestResolve_URLSubject_RegisteredIssuerInfo_OmittedWhenNotFound(t *testing.
 
 	if _, exists := resp["registered_issuer"]; exists {
 		t.Errorf("expected registered_issuer to be absent, got: %v", resp["registered_issuer"])
+	}
+}
+
+func TestResolve_URLSubject_CredentialTypes_ForwardedToPDP(t *testing.T) {
+	// Verify that credential_types from the resolve request are forwarded
+	// to the PDP as action.parameters.credential_types.
+	var receivedReq gotrust.EvaluationRequest
+
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedReq); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// Return a response with credential_type_trust_marks in reason
+		resp := gotrust.EvaluationResponse{
+			Decision: true,
+			Context: &gotrust.EvaluationResponseContext{
+				Reason: map[string]interface{}{
+					"credential_types": []interface{}{"eu.europa.ec.eudi.pid.1"},
+					"credential_type_trust_marks": map[string]interface{}{
+						"eu.europa.ec.eudi.pid.1": []interface{}{"http://registry.example.com/tm/pid"},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp) //nolint:errcheck
+	})
+
+	pdpServer := httptest.NewServer(pdpHandler)
+	defer pdpServer.Close()
+
+	metadata := map[string]interface{}{
+		"credential_issuer":   "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"jwks": map[string]interface{}{
+			"keys": []interface{}{
+				map[string]interface{}{
+					"kty": "EC",
+					"crv": "P-256",
+					"x":   "test-x",
+					"y":   "test-y",
+				},
+			},
+		},
+	}
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{Metadata: metadata},
+	}
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Set("user_id", "test-user")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"subject_id":       "https://issuer.example.com",
+		"subject_type":     "url",
+		"credential_types": []string{"eu.europa.ec.eudi.pid.1"},
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	// Verify credential_types were forwarded to PDP in action.parameters
+	if receivedReq.Action == nil {
+		t.Fatal("expected action to be set in PDP request")
+	}
+	if receivedReq.Action.Name != "credential-issuer" {
+		t.Errorf("expected action.name='credential-issuer', got '%s'", receivedReq.Action.Name)
+	}
+	if receivedReq.Action.Parameters == nil {
+		t.Fatal("expected action.parameters to be set")
+	}
+	ct, ok := receivedReq.Action.Parameters["credential_types"]
+	if !ok {
+		t.Fatal("expected credential_types in action.parameters")
+	}
+	ctSlice, ok := ct.([]interface{})
+	if !ok {
+		t.Fatalf("expected credential_types to be a slice, got %T", ct)
+	}
+	if len(ctSlice) != 1 || ctSlice[0] != "eu.europa.ec.eudi.pid.1" {
+		t.Errorf("unexpected credential_types: %v", ctSlice)
+	}
+
+	// Verify credential_type_trust_marks is returned in response
+	var resp gotrust.EvaluationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if resp.Context == nil || resp.Context.Reason == nil {
+		t.Fatal("expected context.reason in response")
+	}
+	if _, ok := resp.Context.Reason["credential_type_trust_marks"]; !ok {
+		t.Error("expected credential_type_trust_marks in response reason")
+	}
+}
+
+func TestResolve_URLSubject_NoCredentialTypes_OmitsParameters(t *testing.T) {
+	// When credential_types is not provided, action.parameters should be nil.
+	var receivedReq gotrust.EvaluationRequest
+
+	pdpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&receivedReq) //nolint:errcheck
+		resp := gotrust.EvaluationResponse{Decision: true}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp) //nolint:errcheck
+	})
+
+	pdpServer := httptest.NewServer(pdpHandler)
+	defer pdpServer.Close()
+
+	metadata := map[string]interface{}{
+		"credential_issuer":   "https://issuer.example.com",
+		"credential_endpoint": "https://issuer.example.com/credential",
+		"jwks": map[string]interface{}{
+			"keys": []interface{}{
+				map[string]interface{}{"kty": "EC", "crv": "P-256", "x": "test-x", "y": "test-y"},
+			},
+		},
+	}
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{Metadata: metadata},
+	}
+
+	cfg := &config.AuthZENProxyConfig{
+		Enabled:         true,
+		PDPURL:          pdpServer.URL,
+		Timeout:         30,
+		AllowResolution: true,
+	}
+	logger := zap.NewNop()
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, logger)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Set("user_id", "test-user")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"subject_id":   "https://issuer.example.com",
+		"subject_type": "url",
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	// Verify action.parameters is nil when no credential_types provided
+	if receivedReq.Action == nil {
+		t.Fatal("expected action to be set")
+	}
+	if receivedReq.Action.Parameters != nil {
+		t.Errorf("expected nil action.parameters when no credential_types, got: %v", receivedReq.Action.Parameters)
 	}
 }
